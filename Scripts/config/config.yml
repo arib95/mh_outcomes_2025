@@ -1,0 +1,277 @@
+project:
+  outputs_dir: "out"
+  overwrite: true
+  open_mp: true
+  verbose: false
+
+io:
+  inputs:
+    psychometric_matrix_csv: "data/psychometric_matrix.csv"
+    wide_diagnoses_csv: "data/wide_diagnoses.csv"
+    leiden_membership_csv: "cluster_membership_all_participants.csv"
+    bundle_frames_nodes_rds: null
+    connection_edges_csv: null
+    principal_angles_edges_csv: null
+    principal_angles_nodes_csv: null
+    curvature_map_uv_csv: null
+    fibre_energy_by_subject_csv: null
+    unsupervised_risk_subjects_csv: null
+
+  images:
+    png_dpi: 300
+    formats: ["png", "pdf"]
+    width_in: 6.5
+    height_in: 5.0
+
+  files_out:
+    dedup_groups_csv_template: "near_duplicate_groups_complete_eps{eps}.csv"
+    weight_optim_progress_png: "FIG_weight_optim_constrained.png"
+    weight_curve_knee_png: "FIG_weight_curve_knee.png"
+    predictive_item_roles_csv: "predictive_item_roles_diagnostics.csv"
+    fibre_only_summary_rds: "fibre_only_summary.rds"
+    dx_auc_oof_csv: "dx_auc_base_fibre_stacked_with_pr.csv"
+    base_prob_grids_dir: "base_prob_grids/"
+    base_prob_grid_template: "base_prob_grids/probgrid_{dx_safe}.csv"
+    item_dx_interactions_csv: "item_dx_interactions.csv"
+    cluster_summary_csv: "cluster_summary.csv"
+    dx_cluster_enrichment_Z_csv: "dx_cluster_enrichment_Z.csv"
+    dx_cluster_enrichment_p_csv: "dx_cluster_enrichment_p.csv"
+    dx_cluster_enrichment_q_by_dx_csv: "dx_cluster_enrichment_q_by_dx.csv"
+    dx_cluster_enrichment_q_global_csv: "dx_cluster_enrichment_q_global.csv"
+    dx_cluster_prev_in_cluster_csv: "dx_cluster_prev_in_cluster.csv"
+    dx_cluster_enrichment_long_csv: "dx_cluster_enrichment_long.csv"
+    dx_cluster_enrichment_heatmap_png: "FIG_dx_cluster_enrichment_heatmap.png"
+    embedding_base_b1b2_csv: "embedding_base_b1b2.csv"
+    embedding_fibre_Bprime_csv: "embedding_fibre_Bprime.csv"
+    Fprime_matrix_rds: "Fprime_matrix.rds"
+    gower_weights_csv: "gower_weights_optimised.csv"
+    encoding_map_weight_share_csv: "encoding_map_and_weight_share.csv"
+    session_info_txt: "sessionInfo.txt"
+    clustering_sensitivity_seed_bootstrap_long_csv: "clustering_sensitivity_seed_bootstrap_long.csv"
+    clustering_sensitivity_seed_bootstrap_summary_csv: "clustering_sensitivity_seed_bootstrap_summary.csv"
+    major_dx_bootstrap_frequency_by_eligibility_csv: "major_dx_bootstrap_frequency_by_eligibility.csv"
+    dx_space_run_summary_csv: "dx_space_run_summary.csv"
+    embedding_le_csv: "embedding_LE.csv"
+    clusters_unsupervised_csv: "clusters_unsupervised.csv"
+    permanova_dx_in_le_csv: "permanova_dx_in_LE.csv"
+    principal_surface_coords_residuals_csv: "principal_surface_coords_and_residuals.csv"
+    bundle_frames_nodes_rds: "bundle_frames_nodes.rds"
+    connection_edges_csv: "connection_edges.csv"
+    principal_angles_edges_csv: "principal_angles_edges.csv"
+    principal_angles_nodes_csv: "principal_angles_nodes.csv"
+    curvature_map_uv_csv: "curvature_map_uv.csv"
+    fibre_energy_by_subject_csv: "fibre_energy_by_subject.csv"
+    unsupervised_risk_subjects_csv: "unsupervised_risk_subjects.csv"
+    unsupervised_risk_subjects_legacy_curv_csv: "unsupervised_risk_subjects_legacy_curv.csv"
+    dimensional_sweep_r2_csv: "dimensional_sweep_principal_manifold_R2.csv"
+
+images:
+  save: true
+  save_rds: true
+
+palette:
+  engine: "scico"
+  name: "lipari"
+  name_div: "vik"
+  direction: 1
+
+plots:
+  use_ragg: true
+  mm_units: false
+  nu_unit: 400
+  n_base_grid: 140
+  contour_probs: [0.15, 0.25, 0.40, 0.60, 0.80]
+  calib_showpts: true
+  cl_draw_hulls: false
+
+rng:
+  rng_kind: "L'Ecuyer-CMRG"
+  seed: 42
+  seed_pred: 42
+  seed_jitter: 42
+  seed_boot: 42
+  bundle_seed: 42
+
+compute:
+  bam_threads: "all_but_one"
+  blas_threads: 1
+  omp_threads: 1
+  set_env_threads: true
+
+embedding:
+  distance: "gower"
+  knn_k: 10
+  le_dims: 2
+  base_neigh_k: 40
+  id_k_range: [8, 20]
+  pc_max: 6
+  m_default: 4
+  m_star_fixed: 2
+
+embedding_cluster:
+  knn_k: 9
+  knn_variant: "mutual"
+  local_scale: true
+  multiplicity_weight: true
+
+prob_clusters:
+  k_min: 2
+  k_max: 5
+  lambda_grid: [0.0, 0.05, 0.1, 0.2, 0.4, 0.8]
+  knn_base: 12
+  local_scale: true
+  n_start: 3
+  n_iter: 700
+  tol: 1.0e-5
+  eps: 1.0e-10
+  min_pos_def: 10
+  min_neg_def: 10
+  mass_floor_frac: 0.05
+  balance_every: 8
+  reseed_max: 3
+  entropy_push: 0.001
+  w_q: 0.15
+  w_snn: 0.20
+  w_recon: 0.55
+  w_sil: 0.00
+  pen_empty: 0.60
+  pen_imb: 0.15
+  pen_red: 0.02
+  force_leiden_k: false
+
+graph:
+  community_algo: "leiden"
+  leiden_objective: "modularity"
+  leiden_gamma: 0.75
+  leiden_iters: -1
+  min_cluster_size: 2
+  min_cluster_weight: 8
+
+weights:
+  w_min: 0.0
+  grid: [0.95, 0.90, 0.75, 0.5, 0.25, 0.10, 0.05, 0.01, 0.00]
+  batch_k: 3
+  batch_factor: 0.75
+  max_iters: null
+  n_rows_sub: null
+  fix_rep_subset: true
+  ncores_par: "all_but_one"
+
+surface:
+  k_basis_uv: 40
+  surface_cv_folds: 3
+
+bundle_fibre:
+  grid_res_uv: 35
+  k_base: 100
+  k_rank_cap: 4
+  mp_shrink: 0.90
+  min_n_neigh: 50
+  dens_k: 30
+  k_fibre: "derived"
+
+features:
+  corr_trim_threshold: 0.95
+  rare_level_min_prop: 0.01
+  prevalence_min: 0.0
+  dx_min_cases: 10
+  top_items_per_dx: 80
+  show_ns_labels: true
+  include_nodiag: true
+  prevalence_max: 0.99
+  min_in_cases: 5
+  min_out_cases: 5
+  deny_nos: false
+
+majors:
+  alpha_fdr: 0.05
+  min_prev_in_cluster: 0.00
+  min_odds_ratio: 2.0
+  alpha_localize: 0.05
+  auc_min: 0.70
+  prev_min: 0.03
+  ncase_min: 5
+  nin_min: 5
+  nout_min: 0
+  majors_boot_B: 200
+  pillar_B_reps: 200
+
+targets:
+  pref_target: "ANY_DX"
+
+behaviour:
+  vars_keep: null
+  write_plots: true
+  max_k: 8
+  min_pos: 15
+  timeout: 60.0
+  boot:
+    enabled: true
+    B: 199
+
+cv:
+  folds: 5
+  repeats: 1
+  min_test_pos: 5
+  min_test_neg: 5
+  bootstrap_B: 1000
+
+contplot:
+  seed: 42
+  bootstrap_B: 400
+  max_pairs: 2.0e6
+  perm_B: 200
+
+nulls:
+  perm_B: 200
+  degree_reps: 500
+  degree_scope: "kept"
+  sil_reps: 200
+  col_shuffle_reps: 200
+
+sig:
+  method: "perm"
+  fwer: 0.05
+  pred_boot: 200
+  fdr_method: "BH"
+
+absorb:
+  tau: 0.70
+  k_min: 3
+  shared_min: 1
+  perm_B: 200
+  alpha: 0.05
+
+knn_stab:
+  K_range: [10,11,12,13,14,15,16,17,18,19,20]
+  SD_grid: [0, 0.05, 0.10, 0.15, 0.20]
+  reps: 600
+
+dedup:
+  enabled: true
+  eps: null
+  write_csv: true
+  core_band_limits: [0.20, 0.70]
+  core_knn_k: 10
+
+diagnostics:
+  min_n_dx: 25
+  q_alpha: 0.01
+  fibre_k_cap: 3
+
+toggles:
+  do_plots: true
+  do_diagnostics: true
+  do_surface: true
+  do_sweep: true
+  run_prinsurf: false
+  use_surface_cv: true
+  do_corr_trim: false
+
+sweep:
+  k_grid: [5,6,7,8,9,10,11,12,13,14,15]
+  variant_grid: ["union", "mutual"]
+  sweep_boot_B: 25
+
+phate_sweep:
+  nd_range: [1, 5]
