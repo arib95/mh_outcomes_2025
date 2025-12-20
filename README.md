@@ -1,6 +1,6 @@
 ## psy_dimensions_2025
 
-Repository DOI: 10.5281/zenodo.18002564
+Repository DOI: [![DOI](https://zenodo.org/badge/1116410049.svg)](https://doi.org/10.5281/zenodo.18002563)
 
 Supporting source code for Ribeiro & Novais (2025). From categories to fields: a multi-outcome map of mental health. Zenodo. [10.5281/zenodo.17298650](https://doi.org/10.5281/zenodo.17298650) (Preprint).
 
