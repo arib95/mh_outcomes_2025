@@ -443,77 +443,111 @@ optimise_gower_weights_constrained <- function(X, init_weights, allow_update,
 
 # --- Post-Optimization Selection ---
 
-knee_triangle <- function(w) {
+# knee_triangle <- function(w) {
+#   y <- sort(as.numeric(w), decreasing = TRUE)
+#   n <- length(y)
+#   
+#   if (n < 3L) {
+#     return(list(k = n, thr = if (n) y[n] else NA_real_, curve = data.frame(i = seq_len(n), w = y, d = rep(0, n))))
+#   }
+#   
+#   x <- seq_len(n)
+#   num <- abs((y[n] - y[1]) * x - (n - 1) * y + n * y[1] - y[n])
+#   den <- sqrt((y[n] - y[1])^2 + (n - 1)^2)
+#   d <- num / den
+#   k <- which.max(d)
+#   
+#   list(k = k, thr = y[k], curve = data.frame(i = x, w = y, d = d))
+# }
+
+knee_satopaa <- function(w) {
   y <- sort(as.numeric(w), decreasing = TRUE)
   n <- length(y)
-  
-  if (n < 3L) {
-    return(list(k = n, thr = if (n) y[n] else NA_real_, curve = data.frame(i = seq_len(n), w = y, d = rep(0, n))))
-  }
-  
   x <- seq_len(n)
-  num <- abs((y[n] - y[1]) * x - (n - 1) * y + n * y[1] - y[n])
-  den <- sqrt((y[n] - y[1])^2 + (n - 1)^2)
-  d <- num / den
+  
+  if (n < 3L) return(list(k = n, thr = if (n) y[n] else 0.0))
+  
+  # Normalize to Unit Square
+  y_norm <- (y - min(y)) / (max(y) - min(y))
+  x_norm <- (x - min(x)) / (max(x) - min(x))
+  
+  # Calculate Distance from Diagonal 
+  # The sensitivity line is y = 1 - x (for decreasing curves).
+  # Use abs() to detect 'concave' knees (Toes) that dip below the line.
+  d <- abs(y_norm - (1 - x_norm))
+  
+  # Find the point of maximum deviation
   k <- which.max(d)
   
-  list(k = k, thr = y[k], curve = data.frame(i = x, w = y, d = d))
+  list(k = k, thr = y[k])
 }
 
 survivors_from_weights <- function(w, 
                                    w_min = W_MIN,
                                    kmin = NULL,
-                                   eps_ceil = 1e-4,
-                                   eps_floor = 1e-12,
                                    make_plot = TRUE,
                                    plot_file = "FIG_weight_curve_knee.png") {
   
-  if (is.null(names(w))) names(w) <- paste0("V", seq_along(w))
-  w[] <- pmax(w_min, as.numeric(w))
+  w_names <- names(w)
+  if (is.null(w_names)) w_names <- paste0("V", seq_along(w))
+  w <- pmax(w_min, as.numeric(w))
+  names(w) <- w_names
   p <- length(w)
   
-  cat(sprintf("[weights] p=%d | min=%.4f  q25=%.4f  med=%.4f  q75=%.4f  max=%.4f\n",
-              p, min(w), as.numeric(quantile(w, .25)), median(w), as.numeric(quantile(w, .75)), max(w)))
+  w_sorted <- sort(w, decreasing = TRUE)
   
-  idx_ceil <- which(w >= 1 - eps_ceil)
-  idx_tail <- which(w < 1 - eps_ceil & w > w_min + eps_floor)
-  thr_tail <- NA_real_
-  knee_obj <- NULL
+  # Plateau Detection
+  plateau_thresh <- 0.95  # Treat anything > 0.99 as part of the ceiling
+  idx_plateau_end <- max(which(w_sorted >= plateau_thresh))
   
-  if (length(idx_tail) >= 3L) {
-    knee_obj <- knee_triangle(w[idx_tail])
-    thr_tail <- knee_obj$thr
-  } else if (length(idx_tail) > 0L) {
-    thr_tail <- max(w_min + 1e-6, median(w[idx_tail]))
+  if (!is.finite(idx_plateau_end) || idx_plateau_end == p) {
+    idx_start <- 1
+  } else {
+    idx_start <- idx_plateau_end
   }
   
-  S_ceil <- names(w)[idx_ceil]
-  S_tail <- if (is.finite(thr_tail)) names(w)[w >= thr_tail & w < 1 - eps_ceil] else character(0)
-  survivors <- union(S_ceil, S_tail)
+  w_slope <- w_sorted[idx_start:p]
+  
+  # Kneedle on the Slope
+  knee_res <- knee_satopaa(w_slope)
+  
+  # Map back to global indices
+  # The knee index is relative to w_slope, so we add the plateau offset
+  cut_idx <- idx_start + knee_res$k - 1
+  thr_knee <- w_sorted[cut_idx]
   
   if (is.null(kmin)) kmin <- max(30L, ceiling(0.10 * p))
-  if (length(survivors) < kmin) survivors <- names(sort(w, decreasing = TRUE))[seq_len(kmin)]
+  cut_idx <- max(cut_idx, kmin)
+  thr_final <- w_sorted[cut_idx]
   
-  cat(sprintf("Ceiling kept: %d | tail knee thr=%s | survivors: %d / %d\n", 
-              length(S_ceil), ifelse(is.finite(thr_tail), sprintf("%.3f", thr_tail), "NA"), length(survivors), p))
+  survivors <- names(w_sorted)[seq_len(cut_idx)]
+  
+  cat(sprintf("[Selection] Plateau=%d | Knee Offset=%d | Final: %d/%d (thr=%.4f)\n", 
+              idx_start, knee_res$k, length(survivors), p, thr_final))
   
   if (isTRUE(make_plot) && requireNamespace("ggplot2", quietly = TRUE)) {
-    ord <- order(w, decreasing = TRUE)
-    curve <- data.frame(i = seq_along(ord), w = as.numeric(w[ord]))
-    pplt <- ggplot2::ggplot(curve, ggplot2::aes(i, w)) +
+    curve_df <- data.frame(rank = seq_along(w_sorted), weight = w_sorted)
+    
+    # Points to visualize
+    pt_plateau <- curve_df[idx_start, , drop = FALSE]
+    pt_final   <- curve_df[cut_idx, , drop = FALSE]
+    
+    pplt <- ggplot2::ggplot(curve_df, ggplot2::aes(rank, weight)) +
       ggplot2::geom_line() +
-      ggplot2::labs(x = "rank (sorted ↓)", y = "weight", title = "Weight curve with knee (tail-only)") +
-      ggplot2::theme_minimal()
-    if (!is.null(knee_obj)) {
-      thr_mark <- knee_obj$thr
-      knee_row <- curve[which.min(abs(curve$w - thr_mark)), , drop = FALSE]
-      pplt <- pplt + ggplot2::geom_point(data = knee_row, size = 2)
-    }
+      # Show the plateau cutoff
+      ggplot2::geom_point(data = pt_plateau, ggplot2::aes(color = "Plateau End"), size = 2) +
+      # Show the final cut
+      ggplot2::geom_point(data = pt_final, ggplot2::aes(color = "Selected Cut"), shape = 4, size = 4, stroke = 2) +
+      ggplot2::scale_color_manual(values = c("Plateau End" = "orange", "Selected Cut" = "blue")) +
+      ggplot2::labs(x = "Rank (descending)", y = "Weight", color = NULL) +
+      ggplot2::theme_minimal() +
+      ggplot2::theme(legend.position = c(0.8, 0.8))
+    
     print(pplt)
-    save_plot_gg(plot_file, pplt, width = 6, height = 4, dpi = 150)
+    save_plot_gg(plot_file, pplt, width = 6, height = 4, dpi = 300)
   }
   
-  list(survivors = survivors, thr_tail = thr_tail, w_clamped = w)
+  list(survivors = survivors, thr_tail = thr_final, w_clamped = w)
 }
 
 # --- PCA and Residuals Helpers ---
@@ -970,7 +1004,7 @@ nb_list <- setNames(lapply(KS_RESIDUAL, function(k) {
   RANN::nn2(Base_w, Base_w, k = pmin(k + 1L, nrow(Base_w)))$nn.idx[, -1L, drop = FALSE]
 }), paste0("k", KS_RESIDUAL))
 
-# --- Residual Extraction (Fibre) ---
+# --- Residual Extraction  ---
 make_strat_folds <- function(y, K, seed = SEED_GLOBAL) {
   set.seed(seed)
   y <- as.integer(y)
@@ -1013,7 +1047,7 @@ if (any(!is.finite(XR))) XR[!is.finite(XR)] <- 0
 cat(sprintf("[Residuals] XR matrix: %d rows × %d columns (post-OOF, scaled)\n", nrow(XR), ncol(XR)))
 
 # ==============================================================================
-# 6. Item Diagnostics (Base vs Fibre Roles)
+# 6. Item Diagnostics (Base vs Resid Roles)
 # ==============================================================================
 
 Z0_std <- scale(Xenc, center = TRUE, scale = TRUE)
@@ -1036,7 +1070,7 @@ roles_rows <- lapply(vars_diag, function(nm) {
   v <- score_item_base(nm, Z0_std, varmap)
   if (all(is.na(v)) || stats::sd(v, na.rm = TRUE) < MIN_SD_ITEM) return(NULL)
   
-  # Score residual (Fibre)
+  # Score residual
   e_item <- e_from_E(nm, E_scaled, Z0_std, varmap)
   if (all(is.na(e_item)) || stats::sd(e_item, na.rm = TRUE) < MIN_SD_ITEM) return(NULL)
   
@@ -1078,7 +1112,7 @@ if (nrow(roles_df) > 0) {
 }
 
 # ==============================================================================
-# 7. Fibre-Only Decomposition & Clustering
+# 7. Resid-Only Decomposition & Clustering
 # ==============================================================================
 
 stopifnot(exists("E_scaled"), is.matrix(E_scaled), nrow(E_scaled) >= 3) 
@@ -1086,7 +1120,7 @@ Ef <- scale(E_scaled, center = TRUE, scale = TRUE)
 Ef[!is.finite(Ef)] <- 0
 n <- nrow(Ef)
 pE <- ncol(Ef)
-if (pE < 2L || n < 4L) stop("[Fibre-only] insufficient columns/rows in E.")
+if (pE < 2L || n < 4L) stop("[Resid-only] insufficient columns/rows in E.")
 
 RESIDUAL_BASE_MAX <- min(6L, pE, n - 1L)
 
@@ -1195,9 +1229,9 @@ if (ncol(Fprime) >= 2) {
   ID_Fp_all <- ID_Fp_core <- ID_Fp_LB <- NA_real_
 }
 
-cat(sprintf("[Fibre-only] ID(B'): TwoNN_all=%.2f | TwoNN_core=%.2f | LB_core=%.2f (n_core=%d)\n",
+cat(sprintf("[Resid-only] ID(B'): TwoNN_all=%.2f | TwoNN_core=%.2f | LB_core=%.2f (n_core=%d)\n",
             ID_B_all, ID_B_core, ID_B_LB, length(core_B)))
-cat(sprintf("[Fibre-only] ID(F'): TwoNN_all=%.2f | TwoNN_core=%.2f | LB_core=%.2f (n_core=%s)\n",
+cat(sprintf("[Resid-only] ID(F'): TwoNN_all=%.2f | TwoNN_core=%.2f | LB_core=%.2f (n_core=%s)\n",
             ID_Fp_all, ID_Fp_core, ID_Fp_LB, if (exists("core_Fp")) length(core_Fp) else "NA"))
 
 # Clustering in B' (Louvain on kNN graph)
@@ -1220,7 +1254,7 @@ saveRDS(list(
   clusters = clF
 ), file = "residual_only_summary.rds")
 
-cat("[Fibre-only] wrote:", file.path(OUTPUTS_DIR, "residual_only_summary.rds"), "\n")
+cat("[Resid-only] wrote:", file.path(OUTPUTS_DIR, "residual_only_summary.rds"), "\n")
 
 # ==============================================================================
 # 8. Predictive Diagnostics (OOF & Interactions)
@@ -1927,13 +1961,30 @@ plot_biplots <- function(Rtab, Base_A, U) {
   
   cx <- mean(B1n); cy <- mean(B2n)
   Rscale <- 0.80 * min(diff(range(B1n)), diff(range(B2n)))
-  n_arrows <- min(30L, nrow(Rtab))
   
+  # Helper to assign octants based on angle (-pi to pi)
+  # Octant 1: -22.5 to +22.5 (East)
+  # Octant 2: +22.5 to +67.5 (North-East) ... etc.
+  get_octant <- function(x, y) {
+    theta_deg <- atan2(y, x) * 180 / pi
+    # Rotate so -22.5 becomes 0 for easier flooring
+    # Result: 0=East, 1=NE, 2=N, 3=NW, 4=W, 5=SW, 6=S, 7=SE
+    idx <- floor((theta_deg + 22.5 + 360) %% 360 / 45) + 1
+    paste0("Octant_", idx)
+  }
+  
+  # Take top 4 items from each of the 8 octants (32 items total)
   S_base <- Rtab |>
-    dplyr::arrange(dplyr::desc(mag_r_base)) |>
-    dplyr::slice_head(n = n_arrows) |>
     dplyr::mutate(
-      x0 = cx, y0 = cy,
+      octant = get_octant(r_b1, r_b2)
+    ) |>
+    dplyr::group_by(octant) |>
+    dplyr::arrange(dplyr::desc(mag_r_base)) |>
+    dplyr::slice_head(n = 4) |>  # Top 4 per octant
+    dplyr::ungroup() |>
+    dplyr::mutate(
+      x0 = cx, 
+      y0 = cy,
       x1 = cx + Rscale * r_b1,
       y1 = cy + Rscale * r_b2
     )
@@ -1948,8 +1999,8 @@ plot_biplots <- function(Rtab, Base_A, U) {
       arrow = grid::arrow(length = grid::unit(0.14, "cm"))
     ) +
     ggrepel::geom_label_repel(
-      data = transform(S_base, xlab = x1, ylab = y1),
-      ggplot2::aes(x = xlab, y = ylab, label = item),
+      data = S_base,
+      ggplot2::aes(x = x1, y = y1, label = item),
       size = 3.1, max.overlaps = Inf, label.size = 0,
       label.padding = grid::unit(0.10, "lines")
     ) +
@@ -1963,12 +2014,21 @@ plot_biplots <- function(Rtab, Base_A, U) {
   }
   
   Rdisk <- 0.85
+  
   S_disk <- Rtab |>
+    dplyr::mutate(
+      octant = get_octant(r_u1, r_u2)
+    ) |>
+    dplyr::group_by(octant) |>
     dplyr::arrange(dplyr::desc(mag_r_disk)) |>
-    dplyr::slice_head(n = n_arrows) |>
-    dplyr::transmute(item, u0 = 0, v0 = 0,
-                     u1 = as.numeric(Rdisk * r_u1),
-                     v1 = as.numeric(Rdisk * r_u2))
+    dplyr::slice_head(n = 4) |>  # Top 4 per octant in U-space
+    dplyr::ungroup() |>
+    dplyr::transmute(
+      item, 
+      u0 = 0, v0 = 0,
+      u1 = as.numeric(Rdisk * r_u1),
+      v1 = as.numeric(Rdisk * r_u2)
+    )
   
   p_disk <- ggplot2::ggplot() +
     ggplot2::geom_path(data = draw_disk_outline(), ggplot2::aes(x, y)) +
@@ -1979,8 +2039,8 @@ plot_biplots <- function(Rtab, Base_A, U) {
       arrow = grid::arrow(length = grid::unit(0.14, "cm"))
     ) +
     ggrepel::geom_text_repel(
-      data = transform(S_disk, xlab = u1, ylab = v1),
-      ggplot2::aes(x = xlab, y = ylab, label = item),
+      data = S_disk,
+      ggplot2::aes(x = u1, y = v1, label = item),
       size = 3.1, max.overlaps = Inf
     ) +
     ggplot2::coord_equal(xlim = c(-1, 1), ylim = c(-1, 1), expand = FALSE) +

@@ -17,7 +17,8 @@ args <- commandArgs(TRUE)
 if (length(args) >= 1L && nzchar(args[1])) data_dir <- args[1]
 
 # Enumerate CSVs (ignore .xlsx and others)
-csv_files <- sort(list.files(data_dir, pattern = "\\.csv$", full.names = TRUE, ignore.case = TRUE))
+csv_files <- sort(list.files(data_dir, pattern = "\\.csv$", full.names = TRUE, ignore.case = TRUE)) 
+csv_files <- csv_files[basename(csv_files) != "psychometric_matrix.csv"]
 
 if (!length(csv_files)) {
   stop(sprintf("No CSV files found under: %s", normalizePath(data_dir, mustWork = FALSE)))

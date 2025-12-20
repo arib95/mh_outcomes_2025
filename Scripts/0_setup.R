@@ -90,12 +90,12 @@ readRDS <- function(file, ...) {
 # Helper to strip the massive environment from a ggplot object
 clean_ggplot_env <- function(p) {
   if (inherits(p, "ggplot")) {
-    p$plot_env <- rlang::new_environment()  # Replace heavy environment with an empty one
+    p$plot_env <- new.env(parent = emptyenv())
   }
   p
 }
 
-save_plot_gg <- function(name, plot, width, height, dpi = PNG_DPI) {
+save_plot_gg <- function(name, plot, width, height, dpi = PNG_DPI, save_rds = FALSE) {
   # If neither images nor RDS are needed, do nothing
   if (!SAVE_IMAGES && !SAVE_PLOT_RDS) return(invisible())
   
@@ -125,14 +125,12 @@ save_plot_gg <- function(name, plot, width, height, dpi = PNG_DPI) {
     )
   }
   
-  if (SAVE_PLOT_RDS) {
-    # This prevents the RDS from dragging 100MB of global variables (geom, XR) with it.
+  if (save_rds) {
+    # Strip the environment
     plot_clean <- clean_ggplot_env(plot)
-    
-    rds_file <- paste0(base_path, ".rds")
-    saveRDS(plot_clean, file = rds_file)
+    base::saveRDS(plot_clean, file = rds_path)
   }
-  
+
   invisible(plot)
 }
 
@@ -577,8 +575,8 @@ STAB_REPS     <- as.integer(cfg$knn_stab$reps %||% 600L)
 # OUT_SUBDIR    <- "clusters"
 behaviour_csv <- "data/wide_diagnoses.csv"
 OUT_SUBDIR    <- "wide_diagnoses"
-# behaviour_csv <- "data/health.csv"
-# OUT_SUBDIR    <- "health"
+# behaviour_csv <- "data/hopkins.csv"
+# OUT_SUBDIR    <- "hopkins"
 vars_keep     <- cfg$behaviour$vars_keep                 %||% NULL
 write_plots   <- isTRUE(cfg$behaviour$write_plots        %||% DO_PLOTS)
 

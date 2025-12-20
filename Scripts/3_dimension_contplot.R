@@ -825,8 +825,9 @@ clinical_metrics_from_score <- function(y01, score, frac = 0.20) {
   npv_opt <- if ((tn_opt + fn_opt) > 0) tn_opt / (tn_opt + fn_opt) else 0
   thresh_opt <- s_sorted[best_idx]
   
+  nns_opt <- if (ppv_opt > 0) 1 / ppv_opt else NA_real_
+  
   list(
-    # Enrichment stats (keep these for Lift/NNS)
     lift      = if (prev_global > 0) ppv_20 / prev_global else NA_real_,
     nns_model = if (ppv_20 > 0) 1 / ppv_20 else NA_real_,
     nns_base  = nns_base,
@@ -836,7 +837,8 @@ clinical_metrics_from_score <- function(y01, score, frac = 0.20) {
     
     # Optimal Cut metrics
     sens_opt = sens_opt, spec_opt = spec_opt, 
-    ppv_opt = ppv_opt, npv_opt = npv_opt, thresh_opt = thresh_opt
+    ppv_opt = ppv_opt, npv_opt = npv_opt, thresh_opt = thresh_opt,
+    nns_opt = nns_opt
   )
 }
 # --- Bootstrapping Helpers ---
@@ -1729,25 +1731,6 @@ pdp_pd_from_2d <- function(fit2d, Bobs, u, n = 200, weights = NULL) {
 # 7. Surface Plotting & Subtitles
 # ==============================================================================
 
-subtitle_fit <- function(
-  n, K, de_add, de_full, edf_used, kmin_used, dAIC, p_LRT, rho_s, used_model,
-  r2_label = NULL, r2_value = NA_real_
-) {
-  star <- if (is.finite(p_LRT) && p_LRT < 0.05) " ★" else ""
-  r2_txt <- if (!is.null(r2_label) && is.finite(r2_value)) sprintf(" | %s=%.3f", r2_label, r2_value) else ""
-  paste0(
-    "n=", n, ", K=", K, "  |  model=", used_model, "\n",
-    "Dev.expl(add/full)=", sprintf("%.3f/%.3f", de_add, de_full),
-    " | EDF_used=", sprintf("%.1f", edf_used),
-    " | k-index(min)=", ifelse(is.finite(kmin_used), sprintf("%.3f", kmin_used), "NA"),
-    " | ρ_s=", ifelse(is.finite(rho_s), sprintf("%.3f", rho_s), "NA"),
-    r2_txt, "\n",
-    "ΔAIC(add→full)=", ifelse(is.finite(dAIC), sprintf("%.1f", dAIC), "NA"),
-    " | LRT p=", ifelse(is.finite(p_LRT), formatC(p_LRT, digits = 2, format = "e"), "NA"),
-    star
-  )
-}
-
 nice_decade_breaks <- function(x) {
   x <- x[is.finite(x)]
   if (!length(x)) {
@@ -1811,7 +1794,7 @@ plots_for_cont <- function(fields, geom, var_name, subtitle_txt, caption_txt, po
     mapping <- if (is_prob_like) {
       ggplot2::aes(x = .data[[xcol]], y = .data[[ycol]], z = p, label = after_stat(sprintf("%d%%", round(..level.. * 100))))
     } else {
-      ggplot2::aes(x = .data[[xcol]], y = .data[[ycol]], z = p, label = after_stat(signif(..level.., 2)))
+      ggplot2::aes(x = .data[[xcol]], y = .data[[ycol]], z = p, label = after_stat(signif(..level.., 3)))
     }
     metR::geom_contour2(
       data = df, mapping = mapping, breaks = breaks, colour = "white", size = 0.28, label_colour = "white",
@@ -1943,8 +1926,32 @@ analyse_model_kernel <- function(d, yi, v_name, geom, Uobs, XR, is_two_col, K) {
       is_ordinal = isTRUE(yi$is_ordinal),
       levels     = yi$levels %||% NULL
     )
+    
+    if (!is.na(p_boot) && p_boot <= 0.01) {
+      message(sprintf("High significance detected for %s (p=%.3f). Extending B to 1000...\n", v, p_boot))
+      
+      p_boot_high <- lrt_boot_gam(
+        fit_null = fit_add_ml,
+        form_null = f_add,
+        form_alt  = f_full,
+        family    = yi$family,
+        data      = d,
+        B         = 1000,
+        method    = "ML",
+        select    = TRUE,
+        is_two_col = is_two_col,
+        trials     = if (is_two_col) d$M else NULL,
+        is_ordinal = isTRUE(yi$is_ordinal),
+        levels     = yi$levels %||% NULL
+      )
+      
+      # Use the high-res p-value
+      p_boot <- p_boot_high
+    }
+    
+    p_for_fdr <- if (is.finite(p_boot)) p_boot else p_ml
+    
   }
-  p_for_fdr <- if (is.finite(p_boot)) p_boot else p_ml
 
   # R2 Calculation (McFadden for non-Gaussian)
   r2_label <- "McFadden"
@@ -1969,6 +1976,14 @@ analyse_model_kernel <- function(d, yi, v_name, geom, Uobs, XR, is_two_col, K) {
   # --- 3. OOF Predictions ---
   y_strat <- if (is_two_col) d$ys / pmax(d$ys + d$yf, 1L) else d$y
   is_bin_oof <- isTRUE(yi$is_binary) || (!is_two_col && length(unique(d$y)) == 2)
+  
+  # n+ (number of positives) 
+  n_pos <- if (!is_two_col && is_bin_oof) {
+    sum(d$y > 0, na.rm = TRUE)
+  } else {
+    NA_integer_
+  }
+  
   fid <- make_folds_strat_general(y_strat, K = 5, seed = 42)
   p_oof <- rep(NA_real_, nrow(d))
   form_oof <- if (use_full) f_full else f_add
@@ -1998,7 +2013,7 @@ analyse_model_kernel <- function(d, yi, v_name, geom, Uobs, XR, is_two_col, K) {
   oof_hi <- NA
   win_oof <- NA
   skill_oof <- NA
-  p_perm <- NA
+  p_rank <- NA
   oof_auprc_point <- NA
   oof_auprc_lo <- NA
   oof_auprc_hi <- NA
@@ -2039,7 +2054,7 @@ analyse_model_kernel <- function(d, yi, v_name, geom, Uobs, XR, is_two_col, K) {
 
     # Fast Wilcoxon P-value
     wt <- suppressWarnings(stats::wilcox.test(p_oof ~ y_bin))
-    p_perm <- wt$p.value
+    p_rank <- wt$p.value
 
     # Stacking
     if (!is.null(XR)) {
@@ -2077,7 +2092,7 @@ analyse_model_kernel <- function(d, yi, v_name, geom, Uobs, XR, is_two_col, K) {
     # Fast P-value (Correlation)
     method_cor <- if (nrow(d) > 5000) "spearman" else "kendall"
     ct <- suppressWarnings(cor.test(y_strat, p_oof, method = method_cor))
-    p_perm <- ct$p.value
+    p_rank <- ct$p.value
 
     # C-Index (Point Estimate)
     bst <- boot_cindex_single(y_strat, p_oof, B = OOF_BOOT_B, seed = OOF_SEED)
@@ -2168,13 +2183,13 @@ analyse_model_kernel <- function(d, yi, v_name, geom, Uobs, XR, is_two_col, K) {
   max_trials <- if (is_two_col && length(unique(d$ys + d$yf)) == 1) unique(d$ys + d$yf) else NA_integer_
 
   met_row <- data.table::data.table(
-    var = v_name, n = nrow(d), K = K, family = if (inherits(yi$family, "family")) yi$family$family else "other",
+    var = v_name, n = nrow(d), n_pos = n_pos, K = K, family = if (inherits(yi$family, "family")) yi$family$family else "other",
     transform = yi$label, model_plotted = used_model,
     dev_expl_add = de_add, dev_expl_full = de_full, dev_expl_gain = gain, edf_used = edf_used, k_index_min_used = kmin_used, spearman_rho_used = rho_s,
     dAIC_add_to_full = dAIC, aic_weight_full = akaike_weight(dAIC), odds_full_to_add = akaike_odds(dAIC),
     p_for_fdr = p_for_fdr, p_ml_nosel = p_ml, p_boot_interaction = p_boot,
     r2_label = r2_label, r2_value = r2_val,
-    oof_metric = oof_metric, oof_point = oof_point, oof_lo = oof_lo, oof_hi = oof_hi, p_oof = p_perm, win_oof = win_oof,
+    oof_metric = oof_metric, oof_point = oof_point, oof_lo = oof_lo, oof_hi = oof_hi, p_oof = p_rank, win_oof = win_oof,
     oof_auprc_point = oof_auprc_point, oof_auprc_lo = oof_auprc_lo, oof_auprc_hi = oof_auprc_hi,
     oof_auprg_point = oof_auprg_point, oof_auprg_lo = oof_auprg_lo, oof_auprg_hi = oof_auprg_hi,
     auc_residual = auc_residual, auc_residual_lo = auc_residual_lo, auc_residual_hi = auc_residual_hi,
@@ -2194,13 +2209,14 @@ analyse_model_kernel <- function(d, yi, v_name, geom, Uobs, XR, is_two_col, K) {
     clin_spec_opt = clin_res$spec_opt,
     clin_ppv_opt  = clin_res$ppv_opt,
     clin_npv_opt  = clin_res$npv_opt,
-    clin_thresh   = clin_res$thresh_opt
+    clin_thresh   = clin_res$thresh_opt,
+    clin_nns_opt  = clin_res$nns_opt
   )
 
   job <- list(
     key = v_name, label = v_name, fields = fields, points = pts, caption = yi$label, geom = geom,
-    sub_stats = list(n = nrow(d), K = K, de_add = de_add, de_full = de_full, edf = edf_used, kmin = kmin_used, rho = rho_s, r2_lbl = r2_label, r2_val = r2_val, dAIC = dAIC, used_model = used_model, p_LRT = p_ml),
-    oof_stats = list(name = oof_metric, point = oof_point, lo = oof_lo, hi = oof_hi, p = p_perm, auprc = oof_auprc_point, auprg = oof_auprg_point, pr80 = pr_metrics$pr80_20, dpp = pr_metrics$delta_pp, resid = auc_residual, resid_lo = auc_residual_lo, resid_hi = auc_residual_hi, stack = auc_stacked, stack_lo = auc_stacked_lo, stack_hi = auc_stacked_hi, p_delta = p_delta_stacked),
+    sub_stats = list(n = nrow(d), n_pos = n_pos, K = K, de_add = de_add, de_full = de_full, edf = edf_used, kmin = kmin_used, rho = rho_s, r2_lbl = r2_label, r2_val = r2_val, dAIC = dAIC, used_model = used_model, p_LRT = p_ml),
+    oof_stats = list(name = oof_metric, point = oof_point, lo = oof_lo, hi = oof_hi, p = p_rank, auprc = oof_auprc_point, auprg = oof_auprg_point, pr80 = pr_metrics$pr80_20, dpp = pr_metrics$delta_pp, resid = auc_residual, resid_lo = auc_residual_lo, resid_hi = auc_residual_hi, stack = auc_stacked, stack_lo = auc_stacked_lo, stack_hi = auc_stacked_hi, p_delta = p_delta_stacked),
     calib_stats = list(int = calib_intercept, slope = calib_slope, brier = calib_brier, ece = calib_ece, bins = calib_nbins, n_total = calib_ntotal),
     calib_data = list(curve = calib_curve, line = calib_line),
     pd_stats = list(angle = pd_angle, u1 = u_pd[1], u2 = u_pd[2]),
@@ -2334,39 +2350,6 @@ run_one_var <- function(v) {
   # Subset XR to match the finite rows of d_sub
   XR_sub <- if (!is.null(XR)) XR[ok, , drop = FALSE] else NULL
   
-  # --- DIAGNOSTIC START ---
-  # cat(sprintf("\n[DEBUG] Variable: %s\n", v))
-  # cat(sprintf("  Dimensions of DX: %d rows\n", nrow(DX)))
-  # cat(sprintf("  Length of 'ok' vector: %d\n", length(ok)))
-  # cat(sprintf("  Sum of 'ok' (rows to keep): %d\n", sum(ok, na.rm = TRUE)))
-  # cat(sprintf("  Dimensions of d_sub: %d rows\n", nrow(d_sub)))
-  # 
-  # if (is.null(XR)) {
-  #   cat("  Global XR is NULL. (Stacking should be skipped)\n")
-  # } else {
-  #   cat(sprintf("  Global XR dimensions: %d x %d\n", nrow(XR), ncol(XR)))
-  #   
-  #   # Check if global XR aligns with global DX
-  #   if (nrow(XR) != nrow(DX)) {
-  #     cat("  [CRITICAL WARNING] Global XR rows != DX rows. Alignment broken at setup!\n")
-  #   }
-  # }
-  # 
-  # # Create XR_sub explicitly here to test dimensions
-  # XR_debug <- if (!is.null(XR)) XR[ok, , drop = FALSE] else NULL
-  # 
-  # if (!is.null(XR_debug)) {
-  #   cat(sprintf("  XR_sub dimensions: %d x %d\n", nrow(XR_debug), ncol(XR_debug)))
-  #   
-  #   if (nrow(XR_debug) != nrow(d_sub)) {
-  #     cat("  [FAILURE CAUSE] d_sub and XR_sub row counts do not match!\n")
-  #   } else {
-  #     cat("  Status: d_sub and XR_sub align perfectly.\n")
-  #   }
-  # }
-  # cat("------------------------------------------------\n")
-  # --- DIAGNOSTIC END ---
-  
   res <- tryCatch(analyse_model_kernel(d_sub, yi, v, geom, u_sub, XR_sub, isTRUE(yi$two_col), K),
     error = function(e) {
       cat("\n--- FAIL var:", v, "\n")
@@ -2387,9 +2370,6 @@ res_list <- progressr::with_progress({
   FUTURE_LAPPLY(
     vars,
     function(v) {
-      
-      # Explicitly load mgcv for extended families (OCAT, NB)
-      library(mgcv)
       
       # Lock down threading to prevent conflicts in parallel workers
       if (requireNamespace("RhpcBLASctl", quietly = TRUE)) RhpcBLASctl::blas_set_num_threads(1)
@@ -2444,7 +2424,14 @@ if (length(JOBS) > 0 && (is_dx_mode || is_cl_mode)) {
   saveRDS(DX_FIELDS, file.path(OUT_SUBDIR, paste0(prefix, "_fields.rds")))
 }
 
-if (nrow(MET) > 0 && "p_oof" %in% names(MET)) MET[, q_oof := p.adjust(p_oof, method = "BH")]
+if (nrow(MET) > 0) {
+  # Calculate Q-value for OOF predictions
+  if ("p_oof" %in% names(MET)) MET[, q_oof := p.adjust(p_oof, method = "BH")]
+  
+  # Calculate Q-value for Model Interaction (LRT)
+  if ("p_for_fdr" %in% names(MET)) MET[, q_model := p.adjust(p_for_fdr, method = "BH")]
+}
+
 write_csv(MET, file.path(OUT_SUBDIR, "behaviour_map_metrics.csv"))
 
 # ==============================================================================
@@ -2454,6 +2441,22 @@ write_csv(MET, file.path(OUT_SUBDIR, "behaviour_map_metrics.csv"))
 plot_worker <- function(job, OUT_SUBDIR, MET_dt = NULL, OOF_PERM_B = 200) {
   nm <- job$key
   s <- job$sub_stats
+  
+  q_oof_val <- NA_real_
+  q_model_val <- NA_real_
+  
+  if (!is.null(MET_dt)) {
+    # Fetch Q for OOF
+    if ("q_oof" %in% names(MET_dt)) {
+      row_q <- MET_dt[var == nm, q_oof]
+      if (length(row_q)) q_oof_val <- row_q[1]
+    }
+    # Fetch Q for Interaction (Model)
+    if ("q_model" %in% names(MET_dt)) {
+      row_qm <- MET_dt[var == nm, q_model]
+      if (length(row_qm)) q_model_val <- row_qm[1]
+    }
+  }
   
   # --- 1. Data Scaling & Limits ---
   scale_factor <- 1.0
@@ -2494,8 +2497,15 @@ plot_worker <- function(job, OUT_SUBDIR, MET_dt = NULL, OOF_PERM_B = 200) {
   star <- if (is.finite(s$p_LRT) && s$p_LRT < 0.05) " ★" else ""
   r2_txt <- if (!is.null(s$r2_lbl) && is.finite(s$r2_val)) sprintf(" | %s=%.3f", s$r2_lbl, s$r2_val) else ""
   
+  n_plus_txt <- ""
+  if (!is.null(s$n_pos) && is.finite(s$n_pos)) {
+    n_plus_txt <- sprintf(" (n+=%d)", as.integer(s$n_pos))
+  }
+  
   base_txt <- paste0(
-    "n=", s$n, ", K=", s$K, "  |  model=", s$used_model, "\n",
+    sprintf("n=%d%s, K=%d  |  model=%s",
+            as.integer(s$n), n_plus_txt, as.integer(s$K), s$used_model),
+    "\n",
     "Dev.expl(add/full)=", sprintf("%.3f/%.3f", s$de_add, s$de_full),
     " | EDF_used=", sprintf("%.1f", s$edf),
     " | k-index(min)=", ifelse(is.finite(s$kmin), sprintf("%.3f", s$kmin), "NA"),
@@ -2522,14 +2532,14 @@ plot_worker <- function(job, OUT_SUBDIR, MET_dt = NULL, OOF_PERM_B = 200) {
     if (length(row_q)) q_val <- row_q[1]
   }
   
-  p_floor <- 1 / (OOF_PERM_B + 1)
   p_txt <- if (!is.finite(o$p)) {
-    " · no CV signal"
+    " ! no CV signal"
   } else {
-    if (o$p <= p_floor) sprintf(" | perm p<%.3g", p_floor) else sprintf(" | perm p=%.3g", o$p)
+    sprintf(" | p=%.3g", o$p)
   }
+  
   q_txt <- if (is.finite(q_val)) {
-    if (q_val <= p_floor) sprintf(" | q<%.3f", p_floor) else sprintf(" | q=%.3f", q_val)
+    sprintf(" | q=%.3f", q_val)
   } else {
     ""
   }
@@ -2543,7 +2553,6 @@ plot_worker <- function(job, OUT_SUBDIR, MET_dt = NULL, OOF_PERM_B = 200) {
     if (is.finite(o$auprc)) extras <- c(extras, sprintf("\nAUPRC=%.3f", o$auprc))
     if (is.finite(o$auprg)) extras <- c(extras, sprintf("AUPRG=%.3f", o$auprg))
     
-    # [FIX] Clamp PR80 display to avoid "129630"
     if (is.finite(o$pr80)) {
       pr_val <- if(o$pr80 > 100) ">100" else sprintf("%.1f", o$pr80)
       extras <- c(extras, paste0("PR80/20=", pr_val))
@@ -2564,14 +2573,20 @@ plot_worker <- function(job, OUT_SUBDIR, MET_dt = NULL, OOF_PERM_B = 200) {
       if (val < 0.1 && val > 0) "<0.1%" else if (val > 99.9 && val < 100) ">99.9%" else sprintf("%.0f%%", val)
     }
     
-    # Line 1: Optimal Youden Index
-    line_opt <- sprintf("Best Balance (p>%.2f): Sens %s | Spec %s | PPV %s | NPV %s", 
-                        cs$thresh_opt, fmt_pct(cs$sens_opt), fmt_pct(cs$spec_opt), 
-                        fmt_pct(cs$ppv_opt), fmt_pct(cs$npv_opt))
+    line_opt <- sprintf(
+      "Best Balance (p>%.2f): Sens %s | Spec %s | PPV %s | NPV %s | NNS %.0f",
+      cs$thresh_opt,
+      fmt_pct(cs$sens_opt),
+      fmt_pct(cs$spec_opt),
+      fmt_pct(cs$ppv_opt),
+      fmt_pct(cs$npv_opt),
+      cs$nns_opt
+    )
     
-    # Line 2: Screening Utility (20/80)
-    line_scr <- sprintf("Screening (Top 20%%):  Lift %.1fx  |  NNS %.0f (vs %.0f)", 
-                        cs$lift, cs$nns_model, cs$nns_base)
+    line_scr <- sprintf(
+      "Screening (Top 20%%):  Lift %.1fx  |  NNS %.0f (vs %.0f)",
+      cs$lift, cs$nns_model, cs$nns_base
+    )
     
     base_txt <- paste0(base_txt, "\n", line_opt, "\n", line_scr)
   }
@@ -2653,56 +2668,61 @@ plot_worker <- function(job, OUT_SUBDIR, MET_dt = NULL, OOF_PERM_B = 200) {
 
 # --- Pass 2: Serialized Parallel Plotting ---
 
+# MET_dt is just a reference to MET for the plot worker
 if (nrow(MET) > 0) {
-  MET_dt <- as.data.table(MET)
-  if ("p_oof" %in% names(MET_dt)) {
-    MET_dt[, q_oof := p.adjust(p_oof, method = "BH")]
-  }
-  if ("p_for_fdr" %in% names(MET)) {
-    MET[, q_model := p.adjust(p_for_fdr, method = "BH")]
-  }
+  MET_dt <- as.data.table(MET) 
 } else {
   MET_dt <- NULL
 }
 
 message("Pass 2: Plotting...")
 
+# --------- Pass 2: Plotting (Full Parallel) ----------
 if (length(JOBS) > 0) {
-  # Serialize plot jobs to disk to manage memory overhead during parallel plotting
-  job_dir <- file.path(OUTPUTS_DIR, OUT_SUBDIR, "plot_jobs")
-  dir.create(job_dir, recursive = TRUE, showWarnings = FALSE)
-
+  
+  job_dir_abs <- normalizePath(file.path(OUTPUTS_DIR, OUT_SUBDIR, "plot_jobs"), mustWork = FALSE)
+  dir.create(job_dir_abs, recursive = TRUE, showWarnings = FALSE)
+  
   message(sprintf("Serializing %d plot jobs to disk...", length(JOBS)))
-
+  
   job_files <- character(length(JOBS))
-  names(job_files) <- names(JOBS)
-  for (nm in names(JOBS)) {
-    fpath <- file.path(job_dir, paste0("job_", nm, ".rds"))
-    saveRDS(JOBS[[nm]], fpath)
-    job_files[nm] <- fpath
+  job_names <- names(JOBS)
+  
+  for (i in seq_along(JOBS)) {
+    nm <- job_names[i]
+    fpath <- file.path(job_dir_abs, paste0("job_", nm, ".rds"))
+    saveRDS(JOBS[[i]], fpath)
+    job_files[i] <- fpath
   }
-
+  
+  # Clean up RAM
   rm(JOBS, res_list)
   gc()
-
+  
+  message("Rendering plots...")
+  
   progressr::with_progress({
     p <- progressr::progressor(steps = length(job_files))
-
-    invisible(FUTURE_LAPPLY(job_files, function(fpath) {
-      if (requireNamespace("RhpcBLASctl", quietly = TRUE)) RhpcBLASctl::blas_set_num_threads(1)
-      data.table::setDTthreads(1)
-
-      job_data <- readRDS(fpath)
-      tryCatch(plot_worker(job_data, OUT_SUBDIR, MET_dt), error = function(e) {
-        message(sprintf("Error plotting %s: %s", job_data$key, e$message))
-      })
-
-      p()
-      NULL
-    }, future.seed = TRUE))
+    
+    invisible(FUTURE_LAPPLY(
+      job_files, 
+      function(fpath) {
+        if (requireNamespace("RhpcBLASctl", quietly = TRUE)) RhpcBLASctl::blas_set_num_threads(1)
+        data.table::setDTthreads(1)
+        
+        job_data <- readRDS(fpath)
+        
+        tryCatch(plot_worker(job_data, OUT_SUBDIR, MET_dt), error = function(e) {
+          message(sprintf("Error plotting %s: %s", job_data$key, e$message))
+        })
+        
+        p()
+        NULL
+      }, 
+      future.seed = TRUE
+    ))
   })
 }
-
 if (is_dx_mode) saveRDS(DX_FITS, file.path(OUT_SUBDIR, "dx_gam_fits.rds"))
 
 message("Done.")
