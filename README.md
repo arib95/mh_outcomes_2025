@@ -1,4 +1,4 @@
-## psy_dimensions_2025
+## mh_outcomes_2025
 
 Repository DOI: [![DOI](https://zenodo.org/badge/1116410049.svg)](https://doi.org/10.5281/zenodo.18002563)
 
