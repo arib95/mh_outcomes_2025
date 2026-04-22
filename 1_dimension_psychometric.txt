@@ -1027,23 +1027,15 @@ choose_K <- function(y, K_target = CV_FOLDS, min_per_class = 8) {
 }
 
 # Define Target for CV folds
-if (!is.null(DX_wide) && "NODIAG" %in% names(DX_wide)) {
-  y_use <- as.integer(DX_wide$NODIAG == 0L)
-  stopifnot(length(y_use) == nrow(X))
-  
-  cat(sprintf("[target] from NODIAG | prev=%.3f | n0=%d (NODIAG=1) | n1=%d (any dx)\n",
-              mean(y_use), sum(y_use == 0L), sum(y_use == 1L)))
-  
-  K_fold <- choose_K(y_use, K_target = CV_FOLDS, min_per_class = 8)
-  fold_id <- make_strat_folds(y_use, K = K_fold, seed = SEED_GLOBAL)
-} else {
-  n <- nrow(X)
-  K_fold <- max(2L, min(CV_FOLDS, n))
-  fold_id <- sample(rep(seq_len(K_fold), length.out = n))
-  y_use <- rep(NA_integer_, n)
-  
-  message("[target] NODIAG unavailable; using unsupervised folds.")
-}
+stopifnot("NODIAG" %in% names(DX_wide))
+y_use <- as.integer(DX_wide$NODIAG == 0L)  
+stopifnot(length(y_use) == nrow(X))
+
+cat(sprintf("[target] from NODIAG | prev=%.3f | n0=%d (NODIAG=1) | n1=%d (any dx)\n",
+            mean(y_use), sum(y_use == 0L), sum(y_use == 1L)))
+
+K_fold <- choose_K(y_use, K_target = CV_FOLDS, min_per_class = 8)
+fold_id <- make_strat_folds(y_use, K = K_fold, seed = SEED_GLOBAL)
 
 E <- residualise_foldsafe(Xenc_w, Base, folds = fold_id, k_gam = 6)
 E_scaled <- scale(E, center = TRUE, scale = TRUE)
@@ -1124,7 +1116,7 @@ if (nrow(roles_df) > 0) {
 # ==============================================================================
 
 stopifnot(exists("E_scaled"), is.matrix(E_scaled), nrow(E_scaled) >= 3) 
-Ef <- E_scaled
+Ef <- scale(E_scaled, center = TRUE, scale = TRUE)
 Ef[!is.finite(Ef)] <- 0
 n <- nrow(Ef)
 pE <- ncol(Ef)
