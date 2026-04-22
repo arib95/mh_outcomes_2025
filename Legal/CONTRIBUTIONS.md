@@ -1,6 +1,11 @@
 ## CONTRIBUTIONS.md
 
-By contributing, you certify (DCO 1.1) that you have the right to submit the work
-and you license your contribution under the repository’s LICENSE.txt terms.
-You also grant a perpetual, worldwide, royalty-free patent license to practice
-any inventions necessarily infringed by your contribution as part of the Software.
+Thank you for your interest in contributing. However, this project is not accepting 
+external code contributions at this time.
+
+At this stage, the codebase is maintained by the author, and is not
+open to external code contributions. This helps ensure reproducibility and consistency
+with the results reported in the associated publication.
+
+Bug reports, questions, and general feedback are welcome via the issue tracker.
+Please avoid submitting substantial code changes or new implementations.
