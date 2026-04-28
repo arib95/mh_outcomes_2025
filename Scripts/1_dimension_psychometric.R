@@ -7,7 +7,7 @@
 # ==============================================================================
 
 # --- Data Preparation for Gower Distance ---
-prep_X_for_gower <- function(X, rare_prop = 0.01, do_jitter = TRUE) {
+prep_X_for_gower <- function(X, rare_prop = 0.01, do_jitter = TRUE, seed = NULL) {
   X1 <- as.data.frame(X, check.names = TRUE, stringsAsFactors = FALSE)
   
   # Ensure character cols are factors
@@ -28,6 +28,12 @@ prep_X_for_gower <- function(X, rare_prop = 0.01, do_jitter = TRUE) {
   }
   
   X1 <- as.data.frame(lapply(X1, drop_rare, prop = rare_prop), stringsAsFactors = FALSE)
+
+  if (isTRUE(TREAT_ORDINALS_AS_NOMINAL)) {
+    X1 <- as.data.frame(lapply(X1, function(v) {
+      if (is.ordered(v)) factor(v, levels = levels(v), ordered = FALSE, exclude = NULL) else v
+    }), stringsAsFactors = FALSE)
+  }
   
   # Add microscopic jitter to numerics to prevent ties in distance
   if (isTRUE(do_jitter)) {
@@ -35,7 +41,13 @@ prep_X_for_gower <- function(X, rare_prop = 0.01, do_jitter = TRUE) {
       if (is.numeric(X1[[nm]])) {
         sdv <- stats::sd(X1[[nm]], na.rm = TRUE)
         if (is.finite(sdv) && sdv > 0) {
-          X1[[nm]] <- X1[[nm]] + rnorm(length(X1[[nm]]), 0, 1e-6 * sdv)
+          eps <- 1e-6 * sdv
+          if (!is.null(seed)) {
+            s_nm <- .seed_from_key(seed, paste0("prep_jitter::", nm))
+            X1[[nm]] <- X1[[nm]] + .with_seed(s_nm, stats::rnorm(length(X1[[nm]]), 0, eps))
+          } else {
+            X1[[nm]] <- X1[[nm]] + stats::rnorm(length(X1[[nm]]), 0, eps)
+          }
         }
       }
     }
@@ -47,14 +59,17 @@ prep_X_for_gower <- function(X, rare_prop = 0.01, do_jitter = TRUE) {
   
   # Internal helper to detect binary
   .is_binary <- function(x) length(unique(na.omit(x))) == 2
-  bin_cols <- fac_cols[vapply(X1[fac_cols], .is_binary, logical(1))]
+  bin_cols <- if (isTRUE(TREAT_ORDINALS_AS_NOMINAL)) {
+    character(0)
+  } else {
+    fac_cols[vapply(X1[fac_cols], .is_binary, logical(1))]
+  }
   
   type_list <- list()
   if (length(bin_cols)) type_list$asymm <- bin_cols
   if (length(ord_cols)) type_list$ordratio <- ord_cols
   
-  w <- rep(1, ncol(X1))
-  names(w) <- names(X1)
+  w <- setNames(rep(1, ncol(X1)), names(X1))
   
   list(X = X1, type = type_list, weights = w)
 }
@@ -77,6 +92,91 @@ gower_dist <- function(Xdf, type_list = NULL, weights = NULL) {
   
   stopifnot(length(weights) == ncol(Xdf))
   cluster::daisy(Xdf, metric = "gower", type = type_list, weights = weights)
+}
+
+dist_health_console <- function(D, name = "D", eps0 = 1e-12) {
+  M <- as.matrix(D)
+  diag(M) <- Inf
+  n <- nrow(M)
+
+  negM <- -M
+  i1 <- max.col(negM, ties.method = "first")
+  d1 <- M[cbind(seq_len(n), i1)]
+  negM[cbind(seq_len(n), i1)] <- -Inf
+  i2 <- max.col(negM, ties.method = "first")
+  d2 <- M[cbind(seq_len(n), i2)]
+
+  v <- as.numeric(D)
+  v <- v[is.finite(v)]
+  uq <- length(unique(round(v, 10)))
+  prop0 <- mean(v <= eps0)
+
+  qd1 <- stats::quantile(
+    d1[is.finite(d1)],
+    probs = c(0, 0.001, 0.01, 0.05, 0.5, 0.95, 0.99, 1),
+    na.rm = TRUE
+  )
+  eps_adapt <- max(1e-12, as.numeric(qd1[[2]]) * 0.1)
+
+  d1c <- pmax(d1, eps_adapt)
+  d2c <- pmax(d2, d1c + eps_adapt)
+  r <- d2c / d1c
+  lr <- log(r[is.finite(r) & r > 1])
+
+  cat("\n================ DIST HEALTH:", name, "================\n")
+  cat(sprintf("n=%d | unique_dist(rounded 1e-10)=%d | prop(dist<=1e-12)=%.4f\n", n, uq, prop0))
+  cat("d1 quantiles:\n")
+  print(qd1)
+  cat(sprintf(
+    "eps_adapt=%.3g | mean(log r)=%.3f | sd(log r)=%.3f | TwoNN=%.3f\n",
+    eps_adapt,
+    mean(lr, na.rm = TRUE),
+    stats::sd(lr, na.rm = TRUE),
+    1 / mean(lr, na.rm = TRUE)
+  ))
+  cat(sprintf("tie rate (d1 <= eps_adapt): %.4f\n", mean(d1 <= eps_adapt, na.rm = TRUE)))
+}
+
+knn_from_dist <- function(D, k = 15) {
+  M <- as.matrix(D)
+  diag(M) <- Inf
+  t(apply(M, 1, function(r) order(r)[1:k]))
+}
+
+mean_jaccard_knn <- function(idxA, idxB) {
+  stopifnot(nrow(idxA) == nrow(idxB), ncol(idxA) == ncol(idxB))
+  n <- nrow(idxA)
+  s <- 0
+  for (i in seq_len(n)) {
+    a <- idxA[i, ]
+    b <- idxB[i, ]
+    s <- s + length(intersect(a, b)) / length(union(a, b))
+  }
+  s / n
+}
+
+constant_profile_value <- function(Xdf) {
+  n <- nrow(Xdf)
+  if (!n || !ncol(Xdf)) return(rep(NA_character_, n))
+
+  ref <- as.character(Xdf[[1L]])
+  same <- rep(TRUE, n)
+  if (ncol(Xdf) > 1L) {
+    for (j in 2:ncol(Xdf)) {
+      same <- same & (as.character(Xdf[[j]]) == ref)
+    }
+  }
+
+  out <- rep(NA_character_, n)
+  out[same] <- ref[same]
+  out
+}
+
+warn_diag_subsample <- function(tag, n_used, n_total, cap, pool_label = "rows") {
+  warning(sprintf(
+    "[%s] Using %d/%d %s because full distance diagnostics materialise dist objects and dense matrices (O(n^2) memory/time); cap=%d.",
+    tag, n_used, n_total, pool_label, cap
+  ))
 }
 
 # --- Nearest Neighbor Helpers (Vectorized/Fast) ---
@@ -272,8 +372,13 @@ optimise_gower_weights_constrained <- function(X, init_weights, allow_update,
                                                seed_jitter = SEED_JITTER,
                                                reps_idx = NULL,
                                                core_idx_rep = NULL,
+                                               base_seed = SEED_GLOBAL,
                                                verbose = TRUE,
-                                               plot_progress = TRUE) {
+                                               plot_progress = TRUE,
+                                               progress_fun = NULL) {
+  seed_sub  <- .seed_from_key(base_seed, "optim::subsample_rows")
+  seed_iter <- .seed_from_key(base_seed, "optim::iter_sampling")
+  seed_prep <- seed_jitter
   
   # Internal ID calc from numerator/denominator
   calc_id_fast <- function(num, den, n_rows) {
@@ -286,16 +391,35 @@ optimise_gower_weights_constrained <- function(X, init_weights, allow_update,
   }
   
   # Prepare subset
-  px  <- prep_X_for_gower(X, rare_prop = RARE_LEVEL_MIN_PROP, do_jitter = TRUE)
+  px  <- prep_X_for_gower(X, rare_prop = RARE_LEVEL_MIN_PROP, do_jitter = TRUE, seed = seed_prep)
   X0  <- px$X
   typ <- px$type
   
   row_pool <- if (!is.null(reps_idx)) reps_idx else seq_len(nrow(X0))
-  eff_n_sub <- if (is.null(n_rows_sub)) 1000 else min(n_rows_sub, 1500)
+  if (is.null(n_rows_sub) || !length(n_rows_sub)) {
+    eff_n_sub <- 10000L
+  } else if (!is.finite(n_rows_sub) || as.integer(n_rows_sub) <= 0L) {
+    eff_n_sub <- length(row_pool)
+  } else {
+    eff_n_sub <- min(as.integer(n_rows_sub), length(row_pool))
+  }
+
+  if (eff_n_sub > 1500L) {
+    warning(sprintf(
+      "[optim] Large n_sub=%d requested; Gower optimisation can be slow, especially with multi-run enabled.",
+      eff_n_sub
+    ))
+  }
   
   ix_sub_from_reps <- if (length(row_pool) > eff_n_sub) {
-    if (isTRUE(FIX_REP_SUBSET)) head(row_pool, eff_n_sub) else sample(row_pool, eff_n_sub)
-  } else row_pool
+    if (isTRUE(FIX_REP_SUBSET)) {
+      head(row_pool, eff_n_sub)
+    } else {
+      .with_seed(seed_sub, sample(row_pool, eff_n_sub))
+    }
+  } else {
+    row_pool
+  }
   
   Xs <- X0[ix_sub_from_reps, , drop = FALSE]
   n_sub <- nrow(Xs)
@@ -333,7 +457,10 @@ optimise_gower_weights_constrained <- function(X, init_weights, allow_update,
     
     # 1. Stochastic Sampling: Keep hot vars, fill rest with randoms
     n_rnd <- max(10, N_SAMPLE_PER_ITER - length(hot_vars))
-    rnd_vars <- sample(can_all, min(length(can_all), n_rnd))
+    rnd_vars <- .with_seed(
+      as.integer(seed_iter + it),
+      sample(can_all, min(length(can_all), n_rnd))
+    )
     can_iter <- unique(c(hot_vars, rnd_vars))
     
     # 2. Evaluate Candidates (Greedy)
@@ -386,11 +513,18 @@ optimise_gower_weights_constrained <- function(X, init_weights, allow_update,
         break
       }
     }
+
+    if (!is.null(progress_fun) && (it == 1L || it %% 10L == 0L)) {
+      progress_fun(list(iter = it, ID = id))
+    }
     
     # 4. Batch Descent (Every 5th iter)
     if (batch_k > 1 && (it %% 5 == 0)) {
       remain <- setdiff(can_all, best_res$j)
-      remain <- sample(remain, min(length(remain), N_SAMPLE_PER_ITER))
+      remain <- .with_seed(
+        as.integer(seed_iter + 10000L + it),
+        sample(remain, min(length(remain), N_SAMPLE_PER_ITER))
+      )
       
       if (length(remain) > 0) {
         scores <- numeric(length(remain))
@@ -517,10 +651,14 @@ survivors_from_weights <- function(w,
   thr_knee <- w_sorted[cut_idx]
   
   if (is.null(kmin)) kmin <- max(30L, ceiling(0.10 * p))
-  cut_idx <- max(cut_idx, kmin)
+  cut_idx <- min(p, max(cut_idx, kmin))
   thr_final <- w_sorted[cut_idx]
   
   survivors <- names(w_sorted)[seq_len(cut_idx)]
+  active_eps <- GOWER_ACTIVE_EPS
+  if (!is.finite(active_eps) || active_eps <= 0) active_eps <- 1e-8
+  active_eps <- max(active_eps, .Machine$double.eps)
+  active_survivors <- survivors[w_sorted[seq_len(cut_idx)] > (w_min + active_eps)]
   
   cat(sprintf("[Selection] Plateau=%d | Knee Offset=%d | Final: %d/%d (thr=%.4f)\n", 
               idx_start, knee_res$k, length(survivors), p, thr_final))
@@ -547,7 +685,13 @@ survivors_from_weights <- function(w,
     save_plot_gg(plot_file, pplt, width = 6, height = 4, dpi = 300)
   }
   
-  list(survivors = survivors, thr_tail = thr_final, w_clamped = w)
+  list(
+    survivors = survivors,
+    active_survivors = active_survivors,
+    active_eps = active_eps,
+    thr_tail = thr_final,
+    w_clamped = w
+  )
 }
 
 # --- PCA and Residuals Helpers ---
@@ -565,7 +709,11 @@ design_with_map <- function(X) {
   for (nm in names(Xg)) {
     v <- Xg[[nm]]
     if (is.ordered(v)) {
-      Xg[[nm]] <- as.numeric(v)
+      if (isTRUE(TREAT_ORDINALS_AS_NOMINAL)) {
+        Xg[[nm]] <- factor(v, levels = levels(v), ordered = FALSE, exclude = NULL)
+      } else {
+        Xg[[nm]] <- as.numeric(v)
+      }
       next
     }
     if (is.numeric(v) || is.integer(v)) next
@@ -605,25 +753,111 @@ design_with_map <- function(X) {
 residualise_foldsafe <- function(Xenc, Base, folds, k_gam = 6) {
   n <- nrow(Base)
   V <- colnames(Xenc)
-  E <- matrix(NA_real_, n, length(V), dimnames = list(rownames(Base), V))
-  sm_terms <- paste0("s(b", seq_len(ncol(Base)), ",k=", k_gam, ")")
-  
-  for (v in V) {
-    z <- as.numeric(Xenc[, v])
-    for (k in sort(unique(folds))) {
-      tr <- which(folds != k)
-      te <- which(folds == k)
-      dftr <- data.frame(v = z[tr], Base[tr, , drop = FALSE])
-      fml <- reformulate(sm_terms, response = "v")
-      
-      g <- try(mgcv::gam(fml, data = dftr, method = "REML"), silent = TRUE)
-      if (inherits(g, "try-error")) next
-      
-      mu <- as.numeric(predict(g, newdata = data.frame(Base[te, , drop = FALSE]), type = "response"))
-      E[te, v] <- z[te] - mu
-    }
+  if (!length(V)) {
+    return(matrix(numeric(0), nrow = n, ncol = 0L, dimnames = list(rownames(Base), character(0))))
   }
+
+  Xenc_mat <- as.matrix(Xenc)
+  storage.mode(Xenc_mat) <- "double"
+  sm_terms <- paste0("s(b", seq_len(ncol(Base)), ",k=", k_gam, ")")
+  fml_text <- paste("v ~", paste(sm_terms, collapse = " + "))
+  fold_levels <- sort(unique(as.integer(folds)))
+  fold_sets <- lapply(fold_levels, function(k) {
+    list(tr = which(folds != k), te = which(folds == k))
+  })
+  base_frames <- lapply(fold_sets, function(ix) {
+    list(
+      tr = data.frame(Base[ix$tr, , drop = FALSE]),
+      te = data.frame(Base[ix$te, , drop = FALSE])
+    )
+  })
+  n_workers <- tryCatch(as.integer(future::nbrOfWorkers()), error = function(e) 1L)
+  worker_parent <- new.env(parent = globalenv())
+  residualise_worker_core <- residualise_one_col_worker
+  environment(residualise_worker_core) <- worker_parent
+  residualise_worker_env <- list2env(
+    list(
+      Xenc_mat = Xenc_mat,
+      n = n,
+      fold_sets = fold_sets,
+      base_frames = base_frames,
+      fml_text = fml_text,
+      residualise_worker_core = residualise_worker_core
+    ),
+    parent = worker_parent
+  )
+  residualise_task <- function(i) {
+    residualise_worker_core(i, Xenc_mat, n, fold_sets, base_frames, fml_text)
+  }
+  environment(residualise_task) <- residualise_worker_env
+
+  cat(sprintf(
+    "[Residuals] OOF GAM residualisation over %d encoded columns | folds=%d | workers=%d\n",
+    length(V), length(fold_levels), n_workers
+  ))
+
+  if (n_workers <= 1L) {
+    pb <- utils::txtProgressBar(min = 0, max = length(V), style = 3)
+    on.exit(try(close(pb), silent = TRUE), add = TRUE)
+    cols <- lapply(seq_along(V), function(i) {
+      out <- residualise_task(i)
+      utils::setTxtProgressBar(pb, i)
+      out
+    })
+  } else {
+    cols <- FUTURE_LAPPLY(
+      seq_along(V),
+      residualise_task,
+      future.packages = c("mgcv", "stats"),
+      future.seed = TRUE,
+      future.scheduling = 1
+    )
+  }
+
+  E <- do.call(cbind, cols)
+  colnames(E) <- V
+  rownames(E) <- rownames(Base)
   E[, colSums(is.finite(E)) > 0, drop = FALSE]
+}
+
+residualise_one_col_worker <- function(i, Xenc_mat, n, fold_sets, base_frames, fml_text) {
+  if (requireNamespace("RhpcBLASctl", quietly = TRUE)) {
+    try(RhpcBLASctl::blas_set_num_threads(1), silent = TRUE)
+    try(RhpcBLASctl::omp_set_num_threads(1), silent = TRUE)
+  }
+  Sys.setenv(OMP_NUM_THREADS = "1")
+  Sys.setenv(MKL_NUM_THREADS = "1")
+  Sys.setenv(OPENBLAS_NUM_THREADS = "1")
+  options(mc.cores = 1)
+
+  z <- as.numeric(Xenc_mat[, i])
+  e <- rep(NA_real_, n)
+
+  vz <- stats::var(z, na.rm = TRUE)
+  if (!any(is.finite(z)) || !is.finite(vz) || vz <= 1e-12) {
+    return(e)
+  }
+
+  fml_env <- list2env(list(s = mgcv::s), parent = baseenv())
+  fml <- stats::as.formula(fml_text, env = fml_env)
+  gam_ctrl <- mgcv::gam.control(nthreads = 1)
+
+  for (j in seq_along(fold_sets)) {
+    tr <- fold_sets[[j]]$tr
+    te <- fold_sets[[j]]$te
+    if (!length(tr) || !length(te)) next
+
+    dftr <- base_frames[[j]]$tr
+    dftr$v <- z[tr]
+
+    g <- try(mgcv::gam(fml, data = dftr, method = "REML", control = gam_ctrl), silent = TRUE)
+    if (inherits(g, "try-error")) next
+
+    mu <- as.numeric(stats::predict(g, newdata = base_frames[[j]]$te, type = "response"))
+    e[te] <- z[te] - mu
+  }
+
+  e
 }
 
 # --- Diagnostic Metrics Helpers ---
@@ -661,15 +895,26 @@ r2_base_linear <- function(Base, v) {
   summary(fit)$r.squared
 }
 
-r2_residual_cv <- function(e, nb, folds = CV_FOLDS, seed = SEED_GLOBAL) {
-  set.seed(seed)
+r2_residual_cv <- function(e, nb, folds = CV_FOLDS, seed = SEED_GLOBAL, key = NULL) {
   n <- length(e)
   if (n < 10 || var(e, na.rm = TRUE) == 0 || all(is.na(e))) return(NA_real_)
-  
-  fold_id <- sample(rep(1:folds, length.out = n))
+
+  if (length(folds) > 1L) {
+    fold_id <- as.integer(folds)
+    if (length(fold_id) != n) stop("fold_id length mismatch: ", length(fold_id), " vs n=", n)
+    fold_id[!is.finite(fold_id)] <- 1L
+  } else {
+    K <- as.integer(folds[1])
+    if (!is.finite(K) || K < 2L) K <- 2L
+    if (K > n) K <- n
+
+    seed_eff <- if (is.null(key)) as.integer(seed) else .seed_from_key(seed, paste0("r2_resid|", key))
+    fold_id <- .with_seed(seed_eff, sample(rep_len(seq_len(K), n)))
+  }
+
   pred <- rep(NA_real_, n)
   
-  for (f in 1:folds) {
+  for (f in sort(unique(fold_id))) {
     te <- which(fold_id == f)
     if (length(te) == 0) next
     
@@ -714,7 +959,13 @@ interact_worker <- function(i, grid, Zmat, BaseDF, DxDF, map) {
   if (all(is.na(v)) || stats::sd(v, na.rm = TRUE) < 1e-6) return(NULL)
   
   # Run OOF GAMs
-  res <- oof_R2_two_gams(v, BaseDF, y, K_target = 5, k_gam = 10, seed = 42)
+  res <- oof_R2_two_gams(
+    v, BaseDF, y,
+    K_target = 5,
+    k_gam = 10,
+    seed = SEED_GLOBAL,
+    seed_key = paste0(dx_name, "::", nm)
+  )
   
   if (is.finite(unname(res["dR2"]))) {
     return(data.frame(
@@ -731,10 +982,8 @@ interact_worker <- function(i, grid, Zmat, BaseDF, DxDF, map) {
 # 2. Data Ingest
 # ==============================================================================
 
-df <- readr::read_delim(
+df <- readr::read_csv2(
   PSY_CSV,
-  delim = ";",
-  locale = readr::locale(decimal_mark = "."),
   progress = FALSE, show_col_types = FALSE
 )
 
@@ -764,9 +1013,21 @@ for (nm in names(X)) {
     if (!all(is.na(vn))) v <- vn
   }
   if (all(v %in% c(0, 1, NA))) {
-    X[[nm]] <- factor(v, levels = c(0, 1), ordered = TRUE)
+    if (isTRUE(TREAT_ORDINALS_AS_NOMINAL)) {
+      X[[nm]] <- factor(v, ordered = FALSE, exclude = if (isTRUE(MISSING_AS_NOMINAL_LEVEL)) NULL else NA)
+    } else {
+      X[[nm]] <- factor(v, levels = c(0, 1), ordered = TRUE)
+    }
   } else if (is_small_int_scale(v)) {
-    X[[nm]] <- factor(as.integer(round(as.numeric(v))), ordered = TRUE)
+    if (isTRUE(TREAT_ORDINALS_AS_NOMINAL)) {
+      X[[nm]] <- factor(
+        as.integer(round(as.numeric(v))),
+        ordered = FALSE,
+        exclude = if (isTRUE(MISSING_AS_NOMINAL_LEVEL)) NULL else NA
+      )
+    } else {
+      X[[nm]] <- factor(as.integer(round(as.numeric(v))), ordered = TRUE)
+    }
   } else if (is.numeric(v)) {
     X[[nm]] <- as.numeric(v)
   } else {
@@ -779,23 +1040,115 @@ X <- X[keep, , drop = FALSE]
 ids_all <- ids_all[keep]
 rownames(X) <- make.unique(ids_all)
 
-# --- Diagnoses Table Ingest ---
-stopifnot(file.exists(DIAG_CSV))
-diag_wide_full <- readr::read_delim(
-  DIAG_CSV,
-  delim = ";",
-  col_types = readr::cols(),
-  progress = FALSE, show_col_types = FALSE
-) |>
-  dplyr::mutate(participant_id = as.character(participant_id)) |>
-  dplyr::mutate(dplyr::across(
-    -participant_id,
-    ~ {
-      x <- suppressWarnings(as.integer(.))
-      x[is.na(x)] <- 0L
-      pmin(pmax(x, 0L), 1L)
-    }
+degenerate_value <- constant_profile_value(X)
+degenerate_mask <- !is.na(degenerate_value)
+if (any(degenerate_mask)) {
+  degenerate_constant_profiles <- data.frame(
+    row = which(degenerate_mask),
+    participant_id = rownames(X)[degenerate_mask],
+    constant_value = degenerate_value[degenerate_mask],
+    stringsAsFactors = FALSE
+  )
+
+  if (isTRUE(WRITE_DEGENERATE_CSV)) {
+    write_csv(degenerate_constant_profiles, "degenerate_constant_profiles.csv")
+  }
+
+  deg_counts <- sort(table(degenerate_constant_profiles$constant_value), decreasing = TRUE)
+  top_counts <- head(deg_counts, 5L)
+  warning(sprintf(
+    "[data] Found %d fully-constant profiles; kept in analysis%s. Top values: %s",
+    nrow(degenerate_constant_profiles),
+    if (isTRUE(WRITE_DEGENERATE_CSV)) " (see degenerate_constant_profiles.csv)" else "",
+    paste(sprintf("%s=%d", names(top_counts), as.integer(top_counts)), collapse = ", ")
   ))
+} else {
+  degenerate_constant_profiles <- NULL
+}
+
+# --- Diagnoses Table Ingest (OPTIONAL) ---
+DX_AVAILABLE <- FALSE
+diag_wide_full <- NULL
+
+safe_ingest_dx <- function(path, ids_here, optional = TRUE) {
+  if (!nzchar(path) || !file.exists(path)) {
+    if (optional) {
+      message("[dx] Diagnoses file missing; proceeding without diagnoses.")
+      return(list(
+        available = FALSE,
+        diag_wide_full = data.frame(participant_id = ids_here, stringsAsFactors = FALSE)
+      ))
+    } else {
+      stop("Diagnoses file not found: ", path)
+    }
+  }
+  
+  dx <- try(
+    readr::read_csv2(
+      path,
+      col_types = readr::cols(),
+      progress = FALSE, show_col_types = FALSE
+    ),
+    silent = TRUE
+  )
+  
+  if (inherits(dx, "try-error")) {
+    if (optional) {
+      warning("[dx] Read failed; disabling diagnoses (optional).")
+      return(list(
+        available = FALSE,
+        diag_wide_full = data.frame(participant_id = ids_here, stringsAsFactors = FALSE)
+      ))
+    } else {
+      stop(dx)
+    }
+  }
+  
+  dx <- dx %>% dplyr::mutate(participant_id = as.character(participant_id))
+  
+  mm <- match(ids_here, as.character(dx$participant_id))
+  if (all(is.na(mm))) {
+    if (optional) {
+      warning("[dx] Join failed for 100% of rows; disabling diagnoses (optional).")
+      return(list(
+        available = FALSE,
+        diag_wide_full = data.frame(participant_id = ids_here, stringsAsFactors = FALSE)
+      ))
+    } else {
+      stop(sprintf("Diagnoses join failed for %d/%d rows.", sum(is.na(mm)), length(mm)))
+    }
+  }
+  
+  dxA <- dx[mm, , drop = FALSE]
+  dxA$participant_id <- ids_here
+  if (ncol(dxA) > 1) {
+    dxA <- dxA %>%
+      dplyr::mutate(dplyr::across(-participant_id, ~ {
+        x <- suppressWarnings(as.integer(.))
+        x[is.na(x)] <- 0L
+        pmin(pmax(x, 0L), 1L)
+      }))
+  }
+  
+  avail <- (ncol(dxA) > 1) && any(colSums(dxA[, -1, drop = FALSE] > 0, na.rm = TRUE) > 0)
+  list(available = avail, diag_wide_full = dxA)
+}
+
+ids_here <- rownames(X)
+dx_ing   <- safe_ingest_dx(DIAG_CSV, ids_here, optional = isTRUE(DX_OPTIONAL))
+
+DX_AVAILABLE   <- isTRUE(dx_ing$available)
+diag_wide_full <- dx_ing$diag_wide_full
+
+cat(sprintf("[ingest] X rows=%d, cols=%d | DX_available=%s | DX_cols=%d\n",
+            nrow(X), ncol(X), DX_AVAILABLE, max(1L, ncol(diag_wide_full))))
+
+if (DX_AVAILABLE && ncol(diag_wide_full) > 1) {
+  DX_wide <- as.data.frame(diag_wide_full[, -1, drop = FALSE])
+  rownames(DX_wide) <- diag_wide_full$participant_id
+} else {
+  DX_wide <- NULL
+}
 
 # Align diagnoses to X row order
 ids_here <- rownames(X)
@@ -820,44 +1173,168 @@ cat(sprintf(
 # 3. Deduplication and Coreset Selection
 # ==============================================================================
 
-PX <- prep_X_for_gower(X, rare_prop = RARE_LEVEL_MIN_PROP, do_jitter = TRUE)
-X_for_id <- PX$X
-Dg <- gower_dist(X_for_id, type_list = PX$type, weights = PX$weights)
+dedup_mode_eff <- if (!isTRUE(DO_DEDUP)) "none" else DEDUP_MODE
 
-# Auto-detect EPS_DEDUP using knee method if NA
-if (is.na(EPS_DEDUP)) {
-  d1 <- first_nn_d1(Dg)
-  qlo <- as.numeric(stats::quantile(d1[is.finite(d1)], probs = c(0.001, 0.01), na.rm = TRUE))
-  eps_grid <- seq(from = max(0, min(qlo, na.rm = TRUE) - 0.02),
-                  to = min(0.50, stats::quantile(d1, 0.30, na.rm = TRUE)),
-                  by = 0.005)
-  cc <- collapse_curve(Dg, eps_grid)
-  dprop <- diff(cc$prop_retained) / diff(cc$eps)
-  knee_i <- which.min(dprop)
-  EPS_DEDUP <- mean(cc$eps[c(knee_i, knee_i + 1)])
+if (!dedup_mode_eff %in% c("gower_complete", "hash_exact", "hash_round", "none")) {
+  stop("Unknown DEDUP_MODE: ", dedup_mode_eff)
 }
 
-gr_all <- if (isTRUE(DO_DEDUP)) complete_groups(Dg, EPS_DEDUP) else seq_len(attr(Dg, "Size"))
+# Helper: convert a single column to a stable string representation for hashing.
+# Hash modes always use the prepped, non-jittered representation so that ties are
+# preserved and the key is deterministic.
+dedup_key_col <- function(v, mode = c("hash_exact", "hash_round"),
+                          digits = 6L, na_token = "<NA>") {
+  mode <- match.arg(mode)
+  
+  if (is.numeric(v)) {
+    x <- as.numeric(v)
+    
+    if (mode == "hash_exact") {
+      out <- ifelse(is.na(x), na_token, sprintf("%.17g", x))
+      out[out %in% c("-0", "-0.0")] <- "0"
+      return(out)
+    }
+    
+    x <- round(x, digits = digits)
+    fmt <- paste0("%.", digits, "f")
+    out <- ifelse(is.na(x), na_token, sprintf(fmt, x))
+    
+    # Normalise negative zero after rounding
+    zero_tok <- sprintf(fmt, 0)
+    out[grepl(paste0("^-0(?:\\.0+)?$"), out)] <- zero_tok
+    return(out)
+  }
+  
+  if (is.factor(v) || is.ordered(v) || is.character(v) || is.logical(v)) {
+    out <- as.character(v)
+    out[is.na(out)] <- na_token
+    return(out)
+  }
+  
+  out <- as.character(v)
+  out[is.na(out)] <- na_token
+  out
+}
 
-# Identify medoids of groups
-Dm_g <- as.matrix(Dg)
-diag(Dm_g) <- 0
-split_idx <- split(seq_len(nrow(Dm_g)), gr_all)
-reps <- vapply(split_idx, function(ix) {
-  ix[which.min(rowSums(Dm_g[ix, ix, drop = FALSE]))]
-}, integer(1))
-mult <- as.integer(lengths(split_idx))
+# Helper: build duplicate groups from a hashed row key
+dedup_groups_from_hash <- function(Xdf, mode = c("hash_exact", "hash_round"),
+                                   digits = 6L, na_token = "<NA>") {
+  mode <- match.arg(mode)
+  
+  X_key <- as.data.frame(
+    lapply(Xdf, dedup_key_col, mode = mode, digits = digits, na_token = na_token),
+    stringsAsFactors = FALSE,
+    check.names = FALSE
+  )
+  
+  # Use a separator that is highly unlikely to occur in real data
+  key <- do.call(paste, c(X_key, sep = "\r"))
+  split(seq_len(nrow(Xdf)), key, drop = TRUE)
+}
 
-Dg_rep <- stats::as.dist(as.matrix(Dg)[reps, reps, drop = FALSE])
-core_idx_rep <- twonn_core_by_slope(Dg_rep)
-
-cat(sprintf("[Dedup] eps=%.3f | reps=%d of %d | core_rep=%d\n", 
-            EPS_DEDUP, length(reps), nrow(X), length(core_idx_rep)))
-
-if (isTRUE(WRITE_DEDUP_CSV)) {
-  mult_df <- data.frame(rep_row = reps, representative_id = 
-                          rownames(Dm_g)[reps], multiplicity = mult)
-  write_csv(mult_df, sprintf("near_duplicate_groups_complete_eps%g.csv", EPS_DEDUP))
+if (dedup_mode_eff == "gower_complete") {
+  
+  PX <- prep_X_for_gower(X, rare_prop = RARE_LEVEL_MIN_PROP, do_jitter = TRUE, seed = SEED_JITTER)
+  X_for_id <- PX$X
+  Dg <- gower_dist(X_for_id, type_list = PX$type, weights = PX$weights)
+  
+  # Auto-detect EPS_DEDUP using knee method if NA
+  if (is.na(EPS_DEDUP)) {
+    d1 <- first_nn_d1(Dg)
+    qlo <- as.numeric(stats::quantile(d1[is.finite(d1)], probs = c(0.001, 0.01), na.rm = TRUE))
+    eps_grid <- seq(from = max(0, min(qlo, na.rm = TRUE) - 0.02),
+                    to = min(0.50, stats::quantile(d1, 0.30, na.rm = TRUE)),
+                    by = 0.005)
+    cc <- collapse_curve(Dg, eps_grid)
+    dprop <- diff(cc$prop_retained) / diff(cc$eps)
+    knee_i <- which.min(dprop)
+    EPS_DEDUP <- mean(cc$eps[c(knee_i, knee_i + 1)])
+  }
+  
+  gr_all <- complete_groups(Dg, EPS_DEDUP)
+  
+  # Identify medoids of complete-linkage groups
+  Dm_g <- as.matrix(Dg)
+  diag(Dm_g) <- 0
+  split_idx <- split(seq_len(nrow(Dm_g)), gr_all)
+  
+  reps <- vapply(split_idx, function(ix) {
+    ix[which.min(rowSums(Dm_g[ix, ix, drop = FALSE]))]
+  }, integer(1))
+  
+  mult <- as.integer(lengths(split_idx))
+  
+  Dg_rep <- stats::as.dist(Dm_g[reps, reps, drop = FALSE])
+  core_idx_rep <- twonn_core_by_slope(Dg_rep)
+  
+  cat(sprintf("[Dedup:gower_complete] eps=%.3f | reps=%d of %d | core_rep=%d\n",
+              EPS_DEDUP, length(reps), nrow(X), length(core_idx_rep)))
+  
+  if (isTRUE(WRITE_DEDUP_CSV)) {
+    mult_df <- data.frame(
+      rep_row = reps,
+      representative_id = rownames(X_for_id)[reps],
+      multiplicity = mult
+    )
+    write_csv(mult_df, sprintf("near_duplicate_groups_complete_eps%g.csv", EPS_DEDUP))
+  }
+  
+} else if (dedup_mode_eff %in% c("hash_exact", "hash_round")) {
+  
+  # For hash dedup we deliberately disable jitter; otherwise every row becomes unique.
+  PX <- prep_X_for_gower(X, rare_prop = RARE_LEVEL_MIN_PROP, do_jitter = FALSE, seed = SEED_JITTER)
+  X_for_id <- PX$X
+  
+  split_idx <- dedup_groups_from_hash(
+    X_for_id,
+    mode = dedup_mode_eff,
+    digits = DEDUP_HASH_DIGITS,
+    na_token = DEDUP_HASH_NA
+  )
+  
+  # Hash groups do not have an internal distance geometry, so keep the first row
+  # in each group as the deterministic representative.
+  reps <- vapply(split_idx, `[`, integer(1), 1L)
+  mult <- as.integer(lengths(split_idx))
+  
+  # core_idx_rep is currently passed downstream but not actually used by the optimiser.
+  # In hash mode, keep all representatives.
+  core_idx_rep <- seq_along(reps)
+  
+  cat(sprintf("[Dedup:%s] reps=%d of %d | core_rep=%d | hash_digits=%d\n",
+              dedup_mode_eff, length(reps), nrow(X), length(core_idx_rep), DEDUP_HASH_DIGITS))
+  
+  if (isTRUE(WRITE_DEDUP_CSV)) {
+    mult_df <- data.frame(
+      rep_row = reps,
+      representative_id = rownames(X_for_id)[reps],
+      multiplicity = mult
+    )
+    suffix <- if (dedup_mode_eff == "hash_round") {
+      paste0("hash_round_d", DEDUP_HASH_DIGITS)
+    } else {
+      "hash_exact"
+    }
+    write_csv(mult_df, sprintf("near_duplicate_groups_%s.csv", suffix))
+  }
+  
+} else {
+  
+  reps <- seq_len(nrow(X))
+  mult <- rep(1L, nrow(X))
+  core_idx_rep <- seq_along(reps)
+  
+  cat(sprintf("[Dedup:none] reps=%d of %d | core_rep=%d\n",
+              length(reps), nrow(X), length(core_idx_rep)))
+  
+  if (isTRUE(WRITE_DEDUP_CSV)) {
+    mult_df <- data.frame(
+      rep_row = reps,
+      representative_id = rownames(X)[reps],
+      multiplicity = mult
+    )
+    write_csv(mult_df, "near_duplicate_groups_none.csv")
+  }
 }
 
 # ==============================================================================
@@ -890,51 +1367,416 @@ if (DO_CORR_TRIM) {
 }
 cat(sprintf("Start: X_pred has %d columns after constant-drop%s.\n\n", ncol(X_pred), if (DO_CORR_TRIM) " + corr-trim" else ""))
 
+WEIGHTING_MODE <- tolower(WEIGHTING_MODE)
+if (!WEIGHTING_MODE %in% c("id_guided", "uniform")) {
+  stop("Unknown WEIGHTING_MODE: ", WEIGHTING_MODE)
+}
+
 w_init <- setNames(rep(1, ncol(X)), colnames(X))
 allow <- setNames(rep(FALSE, ncol(X)), colnames(X))
 allow[colnames(X_pred)] <- TRUE
+gower_kmin <- max(30L, ceiling(0.10 * length(w_init)))
 
-wopt <- optimise_gower_weights_constrained(X,
-                                           init_weights = w_init,
-                                           allow_update = allow,
-                                           objective = "TwoNN_all",
-                                           w_min = W_MIN,
-                                           step_grid = W_STEP_GRID,
-                                           batch_k = W_BATCH_K,
-                                           batch_factor = W_BATCH_FACTOR,
-                                           max_iter = W_MAX_ITERS,
-                                           n_rows_sub = N_ROWS_SUB,
-                                           ncores = NCORES_PAR,
-                                           seed_jitter = SEED_JITTER,
-                                           reps_idx = reps,
-                                           core_idx_rep = core_idx_rep,
-                                           verbose = TRUE,
-                                           plot_progress = TRUE)
+# --- Gower optimisation: reference run + optional stability replicates ---
+wopt_list <- NULL
+wopt <- NULL
 
-# Select survivor vars via knee on weight tail
-sel <- survivors_from_weights(w = wopt$weights, w_min = W_MIN, kmin = max(30L, ceiling(0.10 * length(wopt$weights))), make_plot = TRUE)
-w_full <- sel$w_clamped
-survivors <- sel$survivors
+if (identical(WEIGHTING_MODE, "id_guided")) {
+  if (GOWER_MULTI_ENABLE && GOWER_MULTI_RUNS > 1L) {
+    cat(sprintf("[Gower-multi] Running %d optimisation replicates (reference run = 1, base seed = %d).\n",
+                GOWER_MULTI_RUNS, SEED_GLOBAL))
+
+    run_ids <- seq_len(GOWER_MULTI_RUNS)
+    worker_parent <- new.env(parent = globalenv())
+
+    hash32_core <- .hash32
+    environment(hash32_core) <- worker_parent
+
+    seed_from_key_core <- .seed_from_key
+    environment(seed_from_key_core) <- list2env(
+      list(.hash32 = hash32_core),
+      parent = worker_parent
+    )
+
+    with_seed_core <- .with_seed
+    environment(with_seed_core) <- worker_parent
+
+    two_nn_from_distvec_core <- .two_nn_from_distvec
+    environment(two_nn_from_distvec_core) <- worker_parent
+
+    twonn_id_from_dist_core <- twonn_id_from_dist
+    environment(twonn_id_from_dist_core) <- list2env(
+      list(.two_nn_from_distvec = two_nn_from_distvec_core),
+      parent = worker_parent
+    )
+
+    prep_X_for_gower_core <- prep_X_for_gower
+    environment(prep_X_for_gower_core) <- list2env(
+      list(
+        .seed_from_key = seed_from_key_core,
+        .with_seed = with_seed_core
+      ),
+      parent = worker_parent
+    )
+
+    make_NS_cache_core <- make_NS_cache
+    environment(make_NS_cache_core) <- worker_parent
+
+    optimise_gower_weights_constrained_core <- optimise_gower_weights_constrained
+    environment(optimise_gower_weights_constrained_core) <- list2env(
+      list(
+        .seed_from_key = seed_from_key_core,
+        .with_seed = with_seed_core,
+        prep_X_for_gower = prep_X_for_gower_core,
+        make_NS_cache = make_NS_cache_core,
+        twonn_id_from_dist = twonn_id_from_dist_core,
+        RARE_LEVEL_MIN_PROP = RARE_LEVEL_MIN_PROP,
+        FIX_REP_SUBSET = FIX_REP_SUBSET
+      ),
+      parent = worker_parent
+    )
+
+    wopt_list <- progressr::with_progress({
+      p <- progressr::progressor(steps = length(run_ids))
+      gower_multi_run_task_env <- list2env(
+        list(
+          .seed_from_key = seed_from_key_core,
+          X = X,
+          w_init = w_init,
+          allow = allow,
+          SEED_GLOBAL = SEED_GLOBAL,
+          SEED_JITTER = SEED_JITTER,
+          W_MIN = W_MIN,
+          W_STEP_GRID = W_STEP_GRID,
+          W_BATCH_K = W_BATCH_K,
+          W_BATCH_FACTOR = W_BATCH_FACTOR,
+          W_MAX_ITERS = W_MAX_ITERS,
+          N_ROWS_SUB = N_ROWS_SUB,
+          NCORES_PAR = NCORES_PAR,
+          reps = reps,
+          core_idx_rep = core_idx_rep,
+          GOWER_MULTI_RUNS = GOWER_MULTI_RUNS,
+          optimise_gower_weights_constrained_core = optimise_gower_weights_constrained_core,
+          p = p
+        ),
+        parent = worker_parent
+      )
+      gower_multi_run_task <- function(r) {
+        base_seed_r <- if (r == 1L) SEED_GLOBAL else .seed_from_key(SEED_GLOBAL, paste0("gower_run_", r))
+        jitter_r <- if (r == 1L) SEED_JITTER else .seed_from_key(SEED_JITTER, paste0("gower_run_", r))
+        verbose_r <- (r == 1L)
+        plot_r <- FALSE
+        progress_cb <- if (r == 1L) {
+          function(info) {
+            cat(sprintf("[Gower ref] iter %d: ID=%.3f\n", info$iter, info$ID))
+          }
+        } else {
+          NULL
+        }
+
+        out <- optimise_gower_weights_constrained_core(
+          X,
+          init_weights = w_init,
+          allow_update = allow,
+          objective = "TwoNN_all",
+          w_min = W_MIN,
+          step_grid = W_STEP_GRID,
+          batch_k = W_BATCH_K,
+          batch_factor = W_BATCH_FACTOR,
+          max_iter = W_MAX_ITERS,
+          n_rows_sub = N_ROWS_SUB,
+          ncores = NCORES_PAR,
+          seed_jitter = jitter_r,
+          reps_idx = reps,
+          core_idx_rep = core_idx_rep,
+          base_seed = base_seed_r,
+          verbose = verbose_r,
+          plot_progress = plot_r,
+          progress_fun = progress_cb
+        )
+
+        p(sprintf("replicate %d/%d", r, GOWER_MULTI_RUNS))
+        out
+      }
+      environment(gower_multi_run_task) <- gower_multi_run_task_env
+
+      FUTURE_LAPPLY(
+        run_ids,
+        gower_multi_run_task,
+        future.packages = "progressr",
+        future.seed = TRUE
+      )
+    })
+
+    wopt <- wopt_list[[1L]]
+  } else {
+    wopt <- optimise_gower_weights_constrained(
+      X,
+      init_weights = w_init,
+      allow_update = allow,
+      objective = "TwoNN_all",
+      w_min = W_MIN,
+      step_grid = W_STEP_GRID,
+      batch_k = W_BATCH_K,
+      batch_factor = W_BATCH_FACTOR,
+      max_iter = W_MAX_ITERS,
+      n_rows_sub = N_ROWS_SUB,
+      ncores = NCORES_PAR,
+      seed_jitter = SEED_JITTER,
+      reps_idx = reps,
+      core_idx_rep = core_idx_rep,
+      base_seed = SEED_GLOBAL,
+      verbose = TRUE,
+      plot_progress = TRUE
+    )
+  }
+
+  ix_pre <- wopt$idx_used
+  PX_pre <- prep_X_for_gower(
+    X[ix_pre, , drop = FALSE],
+    rare_prop = RARE_LEVEL_MIN_PROP,
+    do_jitter = TRUE,
+    seed = SEED_JITTER
+  )
+  Xsub_pre <- PX_pre$X
+  typ_pre <- PX_pre$type
+
+  D_un_pre <- gower_dist(Xsub_pre, type_list = typ_pre, weights = rep(1, ncol(Xsub_pre)))
+  w_pre <- wopt$weights[colnames(Xsub_pre)]
+  D_op_pre <- gower_dist(Xsub_pre, type_list = typ_pre, weights = w_pre)
+
+  dist_health_console(D_un_pre, "unweighted PRE")
+  dist_health_console(D_op_pre, "ID-guided PRE")
+
+  if (!is.null(wopt_list) && length(wopt_list) > 1L) {
+    var_names <- names(wopt$weights)
+    n_runs <- length(wopt_list)
+
+    surv_mat <- matrix(0L, nrow = length(var_names), ncol = n_runs,
+                       dimnames = list(var_names, paste0("run", seq_len(n_runs))))
+    sel_mat <- matrix(0L, nrow = length(var_names), ncol = n_runs,
+                      dimnames = list(var_names, paste0("run", seq_len(n_runs))))
+    final_ID_vec <- rep(NA_real_, n_runs)
+    thr_tail_vec <- rep(NA_real_, n_runs)
+
+    sel_ref <- survivors_from_weights(
+      w = wopt$weights,
+      w_min = W_MIN,
+      kmin = gower_kmin,
+      make_plot = TRUE
+    )
+    sel_mat[sel_ref$survivors, 1L] <- 1L
+    surv_mat[sel_ref$active_survivors, 1L] <- 1L
+    final_ID_vec[1L] <- wopt$final_ID
+    thr_tail_vec[1L] <- sel_ref$thr_tail
+
+    if (n_runs > 1L) {
+      for (r in 2:n_runs) {
+        wr <- wopt_list[[r]]$weights
+        sel_r <- survivors_from_weights(
+          w = wr,
+          w_min = W_MIN,
+          kmin = gower_kmin,
+          make_plot = FALSE
+        )
+        sel_mat[sel_r$survivors, r] <- 1L
+        surv_mat[sel_r$active_survivors, r] <- 1L
+        final_ID_vec[r] <- wopt_list[[r]]$final_ID
+        thr_tail_vec[r] <- sel_r$thr_tail
+      }
+    }
+
+    surv_count <- rowSums(surv_mat)
+    surv_prop <- surv_count / n_runs
+    sel_count <- rowSums(sel_mat)
+    sel_prop <- sel_count / n_runs
+    Wmat <- vapply(seq_len(n_runs), function(r) wopt_list[[r]]$weights[var_names], numeric(length(var_names)))
+    dimnames(Wmat) <- list(var_names, paste0("run", seq_len(n_runs)))
+
+    stability_tbl <- data.frame(
+      var = var_names,
+      count = as.integer(surv_count),
+      prop = as.numeric(surv_prop),
+      count_selected = as.integer(sel_count),
+      prop_selected = as.numeric(sel_prop),
+      selected_ref = var_names %in% sel_ref$survivors,
+      in_ref = var_names %in% sel_ref$active_survivors,
+      weight_ref = as.numeric(wopt$weights[var_names]),
+      weight_mean = rowMeans(Wmat, na.rm = TRUE),
+      weight_sd = apply(Wmat, 1L, stats::sd, na.rm = TRUE),
+      weight_min = apply(Wmat, 1L, min, na.rm = TRUE),
+      weight_max = apply(Wmat, 1L, max, na.rm = TRUE),
+      stringsAsFactors = FALSE
+    )
+    stability_tbl <- stability_tbl[order(-stability_tbl$prop, -stability_tbl$weight_mean), ]
+
+    write_csv(stability_tbl, "gower_survivor_stability.csv")
+    write_csv(
+      data.frame(var = rownames(Wmat), Wmat, check.names = FALSE, stringsAsFactors = FALSE),
+      "gower_weights_by_run_wide.csv"
+    )
+
+    active_floor <- W_MIN + sel_ref$active_eps
+    robust_mask <- stability_tbl$prop >= GOWER_MULTI_MIN_PROP & stability_tbl$weight_max > active_floor
+    if (!any(robust_mask)) {
+      warning(sprintf(
+        "[Gower-multi] No active variable met prop >= %.2f; falling back to active reference survivors.",
+        GOWER_MULTI_MIN_PROP
+      ))
+      robust_set <- sel_ref$active_survivors
+      if (!length(robust_set)) robust_set <- sel_ref$survivors
+      robust_mask <- stability_tbl$var %in% robust_set
+    } else {
+      robust_set <- stability_tbl$var[robust_mask]
+    }
+
+    cat(sprintf(
+      "[Gower-multi] Reference selected = %d | reference active = %d | robust survivors = %d (min_prop=%.2f, runs=%d).\n",
+      length(sel_ref$survivors), length(sel_ref$active_survivors), length(robust_set), GOWER_MULTI_MIN_PROP, n_runs
+    ))
+
+    w_multi_raw <- with(stability_tbl, weight_mean - W_MIN * (1 - prop))
+    w_multi_raw[!is.finite(w_multi_raw)] <- 0
+    w_multi_raw <- pmax(0, w_multi_raw)
+    scale_fac <- max(w_multi_raw[robust_mask], na.rm = TRUE)
+    if (!is.finite(scale_fac) || scale_fac <= 0) scale_fac <- 1
+
+    w_full <- setNames(as.numeric(w_multi_raw / scale_fac), stability_tbl$var)
+    survivors <- robust_set
+
+    saveRDS(list(
+      n_runs = n_runs,
+      ref_run = 1L,
+      min_prop = GOWER_MULTI_MIN_PROP,
+      final_ID = final_ID_vec,
+      thr_tail = thr_tail_vec,
+      survivors_ref = sel_ref$survivors,
+      survivors_ref_active = sel_ref$active_survivors,
+      survivors_robust = robust_set,
+      weights = lapply(wopt_list, function(z) z$weights)
+    ), file = "gower_multi_runs_summary.rds")
+  } else {
+    sel <- survivors_from_weights(
+      w = wopt$weights,
+      w_min = W_MIN,
+      kmin = gower_kmin,
+      make_plot = TRUE
+    )
+    w_full <- sel$w_clamped
+    survivors <- sel$survivors
+  }
+} else {
+  survivors <- colnames(X_pred)
+  if (!length(survivors)) {
+    stop("[weights] uniform mode retained zero predictors after preprocessing.")
+  }
+
+  w_full <- setNames(rep(0, ncol(X)), colnames(X))
+  w_full[survivors] <- 1
+  wopt <- list(
+    idx_used = reps,
+    history = data.frame(),
+    final_ID = NA_real_,
+    weights = w_full
+  )
+
+  cat(sprintf(
+    "[weights] Uniform mode: skipping Gower optimisation; retaining %d/%d predictors with unit weights.\n",
+    length(survivors), ncol(X)
+  ))
+}
+
 X <- X[, survivors, drop = FALSE]
 w_all <- w_full[survivors]
-cat(sprintf("[TwoNN optimiser] Survivors: p=%d\n", ncol(X)))
+cat(sprintf("[weights] Mode=%s | retained predictors: p=%d\n", WEIGHTING_MODE, ncol(X)))
 
-# Recalculate Distances with final weights
-PX <- prep_X_for_gower(X, rare_prop = RARE_LEVEL_MIN_PROP, do_jitter = TRUE)
+# Recalculate Distances with final weights on a diagnostic subset only
+PX <- prep_X_for_gower(X, rare_prop = RARE_LEVEL_MIN_PROP, do_jitter = TRUE, seed = SEED_JITTER)
 Xg <- PX$X
 type_g <- PX$type
 w_use <- w_all[colnames(Xg)]
 
-D_final <- cluster::daisy(Xg, metric = "gower", type = type_g, weights = w_use)
-ID_all <- twonn_id_from_dist(D_final)
-core_ix <- twonn_core_by_slope(D_final)
-DmF <- as.matrix(D_final)
-diag(DmF) <- Inf
-ID_core <- twonn_id_from_dist(as.dist(DmF[core_ix, core_ix, drop = FALSE]))
-ID_LB <- lb_mle_id(DmF[core_ix, core_ix, drop = FALSE], 5, 15)
+if (!FINAL_DIAG_MODE %in% c("full", "reps", "sample_reps", "sample_all", "none")) {
+  stop("Unknown FINAL_DIAG_MODE: ", FINAL_DIAG_MODE)
+}
 
-cat(sprintf("[Constrained %s] TwoNN_all=%.2f | TwoNN_core=%.2f | LB_core=%.2f (n_core=%d, p_active=%d)\n",
-            toupper(PREF_TARGET), ID_all, ID_core, ID_LB, length(core_ix), ncol(Xg)))
+# Build diagnostic index set
+diag_idx <- switch(
+  FINAL_DIAG_MODE,
+  
+  "none" = integer(0),
+  
+  "full" = seq_len(nrow(Xg)),
+  
+  "reps" = {
+    if (exists("reps") && length(reps) > 0L) reps else seq_len(nrow(Xg))
+  },
+  
+  "sample_reps" = {
+    pool <- if (exists("reps") && length(reps) > 0L) reps else seq_len(nrow(Xg))
+    n_take <- min(length(pool), DIAG_N_MAX)
+    if (length(pool) > n_take) {
+      warn_diag_subsample("Final diag", n_take, length(pool), DIAG_N_MAX, "representatives")
+      .with_seed(.seed_from_key(SEED_GLOBAL, "final_diag_sample_reps"), sample(pool, n_take))
+    } else {
+      pool
+    }
+  },
+  
+  "sample_all" = {
+    pool <- seq_len(nrow(Xg))
+    n_take <- min(length(pool), DIAG_N_MAX)
+    if (length(pool) > n_take) {
+      warn_diag_subsample("Final diag", n_take, length(pool), DIAG_N_MAX, "rows")
+      .with_seed(.seed_from_key(SEED_GLOBAL, "final_diag_sample_all"), sample(pool, n_take))
+    } else {
+      pool
+    }
+  }
+)
+
+if (length(diag_idx) >= 3L) {
+  Xg_diag <- Xg[diag_idx, , drop = FALSE]
+  
+  D_final <- cluster::daisy(Xg_diag, metric = "gower", type = type_g, weights = w_use)
+  D_un_final <- cluster::daisy(Xg_diag, metric = "gower", type = type_g, weights = rep(1, ncol(Xg_diag)))
+  ID_all <- twonn_id_from_dist(D_final)
+  core_ix <- twonn_core_by_slope(D_final)
+  
+  DmF <- as.matrix(D_final)
+  diag(DmF) <- Inf
+  
+  ID_core <- if (length(core_ix) >= 3L) {
+    twonn_id_from_dist(as.dist(DmF[core_ix, core_ix, drop = FALSE]))
+  } else {
+    NA_real_
+  }
+  
+  ID_LB <- if (length(core_ix) >= 15L) {
+    lb_mle_id(DmF[core_ix, core_ix, drop = FALSE], 5, 15)
+  } else {
+    NA_real_
+  }
+  
+  cat(sprintf(
+    "[Constrained %s | diag=%s | n=%d] TwoNN_all=%.2f | TwoNN_core=%.2f | LB_core=%.2f (n_core=%d, p_active=%d)\n",
+    toupper(PREF_TARGET), FINAL_DIAG_MODE, nrow(Xg_diag),
+    ID_all, ID_core, ID_LB, length(core_ix), ncol(Xg)
+  ))
+
+  dist_health_console(D_un_final, sprintf("unweighted FINAL (%s)", FINAL_DIAG_MODE))
+  dist_health_console(D_final, sprintf("weighted FINAL (%s)", FINAL_DIAG_MODE))
+  for (k in c(10, 15, 30)) {
+    nn_un <- knn_from_dist(D_un_final, k = k)
+    nn_op <- knn_from_dist(D_final, k = k)
+    cat(sprintf("[kNN overlap FINAL] k=%d | mean Jaccard = %.3f\n", k, mean_jaccard_knn(nn_un, nn_op)))
+  }
+} else {
+  cat(sprintf(
+    "[Constrained %s | diag=%s] Final distance-based diagnostics skipped.\n",
+    toupper(PREF_TARGET), FINAL_DIAG_MODE
+  ))
+}
 
 # ==============================================================================
 # 5. PCA, Whitening, and Residuals
@@ -959,36 +1801,48 @@ Xenc_w <- sweep(Xenc, 2, sqrt(pmax(w_enc, 0)), "*")
 m_star <- as.integer(M_STAR_FIXED)
 Z <- scale(Xenc_w, center = TRUE, scale = TRUE)
 
-# Robust PCA via PcaHubert (ROBPCA)
+BASE_DECOMP_METHOD <- tolower(BASE_DECOMP_METHOD)
+if (!BASE_DECOMP_METHOD %in% c("robust_pca", "pca")) {
+  stop("Unknown BASE_DECOMP_METHOD: ", BASE_DECOMP_METHOD)
+}
+
 k_eff <- max(2L, min(m_star, nrow(Z) - 1L, ncol(Z)))
-rp <- rrcov::PcaHubert(
-  x        = Z,
-  k        = k_eff,        # number of components to keep
-  kmax     = k_eff,        # don't compute more than you need
-  scale    = FALSE,        # Z is already standardised
-  signflip = TRUE          # make loadings comparable to prcomp()
-)
-Base <- rp@scores[, 1:m_star, drop = FALSE]
+
+if (identical(BASE_DECOMP_METHOD, "robust_pca")) {
+  rp <- rrcov::PcaHubert(
+    x        = Z,
+    k        = k_eff,
+    kmax     = k_eff,
+    scale    = FALSE,
+    signflip = TRUE
+  )
+  Base <- rp@scores[, 1:m_star, drop = FALSE]
+  base_loadings <- rp@loadings[, 1:m_star, drop = FALSE]
+  base_spectrum <- rp@eigenvalues[seq_len(k_eff)]
+} else {
+  pc <- stats::prcomp(Z, center = FALSE, scale. = FALSE, rank. = k_eff)
+  Base <- pc$x[, 1:m_star, drop = FALSE]
+  base_loadings <- pc$rotation[, 1:m_star, drop = FALSE]
+  base_spectrum <- pc$sdev[seq_len(k_eff)]^2
+}
+
+base_total_var <- sum(apply(Z, 2, stats::var))
+base_explained_variance_ratio <- base_spectrum / pmax(base_total_var, 1e-12)
+
 colnames(Base) <- paste0("b", seq_len(ncol(Base)))
+colnames(base_loadings) <- paste0("b", seq_len(ncol(base_loadings)))
 
-# --- Orientation Fix ---
-# 1. Automate orientation via skewness (align heavy tail to positive)
-# m1 <- apply(Base[, 1:2, drop = FALSE], 2, function(x) mean((x - mean(x))^3) / sd(x)^3)
+# Base[, 1] <- -Base[, 1]
+# base_loadings[, 1] <- -base_loadings[, 1]
+# Base[, 2] <- -Base[, 2]
+# base_loadings[, 2] <- -base_loadings[, 2]
 
-#if (is.finite(m1[1]) && is.finite(m1[2]) && (m1[2] < m1[1])) {
-  Base[, 1] <- -Base[, 1]
-  rp@loadings[, 1] <- -rp@loadings[, 1]
-#}
-
-# 2. Hard override for dim 2 (ext up)
-Base[, 2] <- -Base[, 2] 
-rp@loadings[, 2] <- -rp@loadings[, 2]
-
-# 3. Create snapshot for plotting
 Base_A <- as.data.frame(Base[, 1:2, drop = FALSE])
 colnames(Base_A) <- c("b1", "b2")
+ids_base <- rownames(Base)
+stopifnot(length(ids_base) == nrow(Base), all(nzchar(ids_base)))
 
-cat("[Orientation] Base coordinates flipped. Proceeding to Whitening...\n")
+cat(sprintf("[Base] Decomposition=%s. Proceeding to Whitening...\n", BASE_DECOMP_METHOD))
 
 # --- Whitening for Neighbour Search ---
 S <- stats::cov(Base)
@@ -1005,18 +1859,23 @@ nb_list <- setNames(lapply(KS_RESIDUAL, function(k) {
 }), paste0("k", KS_RESIDUAL))
 
 # --- Residual Extraction  ---
-make_strat_folds <- function(y, K, seed = SEED_GLOBAL) {
-  set.seed(seed)
+make_strat_folds <- function(y, K, seed = SEED_GLOBAL, key = NULL) {
   y <- as.integer(y)
   n <- length(y)
-  folds <- integer(n)
-  idx0 <- which(y == 0)
-  idx1 <- which(y == 1)
-  f0 <- sample(rep(1:K, length.out = length(idx0)))
-  f1 <- sample(rep(1:K, length.out = length(idx1)))
-  folds[idx0] <- f0
-  folds[idx1] <- f1
-  folds
+  K <- as.integer(K[1])
+  if (!is.finite(K) || K < 2L) K <- 2L
+  if (K > n) K <- n
+
+  seed_eff <- if (is.null(key)) as.integer(seed) else .seed_from_key(seed, paste0("strat|", key))
+
+  .with_seed(seed_eff, {
+    folds <- integer(n)
+    idx0 <- which(y == 0)
+    idx1 <- which(y == 1)
+    if (length(idx0)) folds[idx0] <- sample(rep(seq_len(K), length.out = length(idx0)))
+    if (length(idx1)) folds[idx1] <- sample(rep(seq_len(K), length.out = length(idx1)))
+    folds
+  })
 }
 
 choose_K <- function(y, K_target = CV_FOLDS, min_per_class = 8) {
@@ -1035,11 +1894,14 @@ if (!is.null(DX_wide) && "NODIAG" %in% names(DX_wide)) {
               mean(y_use), sum(y_use == 0L), sum(y_use == 1L)))
   
   K_fold <- choose_K(y_use, K_target = CV_FOLDS, min_per_class = 8)
-  fold_id <- make_strat_folds(y_use, K = K_fold, seed = SEED_GLOBAL)
+  fold_id <- make_strat_folds(y_use, K = K_fold, seed = SEED_GLOBAL, key = "target_folds")
 } else {
   n <- nrow(X)
   K_fold <- max(2L, min(CV_FOLDS, n))
-  fold_id <- sample(rep(seq_len(K_fold), length.out = n))
+  fold_id <- .with_seed(
+    .seed_from_key(SEED_GLOBAL, "target_unsupervised_folds"),
+    sample(rep(seq_len(K_fold), length.out = n))
+  )
   y_use <- rep(NA_integer_, n)
   
   message("[target] NODIAG unavailable; using unsupervised folds.")
@@ -1062,8 +1924,19 @@ Z0_std <- scale(Xenc, center = TRUE, scale = TRUE)
 vars_diag <- unique(varmap)
 
 # Helper for KNN K selection
-choose_k_nb <- function(e, nb_list, folds = CV_FOLDS, seed = SEED_GLOBAL) {
-  r2s <- vapply(nb_list, function(nb) r2_residual_cv(e, nb, folds, seed), numeric(1))
+choose_k_nb <- function(e, nb_list, folds = CV_FOLDS, seed = SEED_GLOBAL, key = NULL) {
+  folds_use <- folds
+  if (length(folds) == 1L) {
+    K <- as.integer(folds[1])
+    if (!is.finite(K) || K < 2L) K <- 2L
+    if (K > length(e)) K <- length(e)
+    seed_eff <- if (is.null(key)) as.integer(seed) else .seed_from_key(seed, paste0("choose_knn|", key))
+    folds_use <- .with_seed(seed_eff, sample(rep_len(seq_len(K), length(e))))
+  }
+
+  r2s <- vapply(nb_list, function(nb) {
+    r2_residual_cv(e, nb, folds = folds_use, seed = seed)
+  }, numeric(1))
   ix <- which.max(r2s)
   list(k = as.integer(sub("^k", "", names(nb_list)[ix])), R2_cv = r2s[ix])
 }
@@ -1084,7 +1957,7 @@ roles_rows <- lapply(vars_diag, function(nm) {
   
   # Metrics
   R2_base <- r2_base_linear(Base, v)
-  sel <- choose_k_nb(e_item, nb_list, folds = CV_FOLDS, seed = SEED_GLOBAL)
+  sel <- choose_k_nb(e_item, nb_list, folds = CV_FOLDS, seed = SEED_GLOBAL, key = nm)
   R2_resid <- sel$R2_cv
   
   data.frame(
@@ -1136,63 +2009,130 @@ pc_f <- prcomp(Ef, rank. = max(2L, RESIDUAL_BASE_MAX))
 Bprime_all <- pc_f$x[, 1:RESIDUAL_BASE_MAX, drop = FALSE]
 colnames(Bprime_all) <- paste0("f", seq_len(ncol(Bprime_all)))
 
-pick_m_via_tc <- function(Xhigh, Xlow_all, ks = 10:30, mmax = ncol(Xlow_all), lambda = 0.02) {
-  trust_cont <- function(high, low, ks = 10:30) {
+pick_m_via_tc <- function(Xhigh,
+                          Xlow_all,
+                          ks = 10:30,
+                          mmax = ncol(Xlow_all),
+                          lambda = 0.02,
+                          max_n = DIAG_N_MAX,
+                          pool_idx = NULL,
+                          seed = SEED_GLOBAL,
+                          key = "pick_m_via_tc") {
+  Xhigh <- as.matrix(Xhigh)
+  Xlow_all <- as.matrix(Xlow_all)
+  stopifnot(nrow(Xhigh) == nrow(Xlow_all))
+
+  mmax <- min(as.integer(mmax), ncol(Xlow_all))
+  if (!is.finite(mmax) || mmax < 2L) return(max(1L, mmax))
+
+  n_full <- nrow(Xhigh)
+  if (!is.finite(max_n) || max_n <= 0L) max_n <- n_full
+  max_n <- max(as.integer(max_n), max(ks) + 2L, 3L)
+  if (is.null(pool_idx) || !length(pool_idx)) {
+    pool_idx <- seq_len(n_full)
+  } else {
+    pool_idx <- sort(unique(as.integer(pool_idx)))
+    pool_idx <- pool_idx[is.finite(pool_idx) & pool_idx >= 1L & pool_idx <= n_full]
+    if (!length(pool_idx)) pool_idx <- seq_len(n_full)
+  }
+
+  if (length(pool_idx) > max_n) {
+    warn_diag_subsample(
+      "pick_m_via_tc",
+      max_n,
+      length(pool_idx),
+      max_n,
+      if (length(pool_idx) < n_full) "representatives" else "rows"
+    )
+    idx <- .with_seed(.seed_from_key(seed, key), sample(pool_idx, max_n))
+    Xhigh <- Xhigh[idx, , drop = FALSE]
+    Xlow_all <- Xlow_all[idx, , drop = FALSE]
+  } else if (length(pool_idx) < n_full) {
+    idx <- pool_idx
+    Xhigh <- Xhigh[idx, , drop = FALSE]
+    Xlow_all <- Xlow_all[idx, , drop = FALSE]
+  }
+
+  rank_from_dist <- function(D) {
+    n <- nrow(D)
+    R <- matrix(0L, n, n)
+    for (i in seq_len(n)) {
+      ord <- order(D[i, ])
+      R[i, ord] <- seq_len(n)
+    }
+    R
+  }
+
+  trust_cont <- function(high, low, ks = 10:30, Rh = NULL) {
     high <- as.matrix(high)
     low <- as.matrix(low)
     stopifnot(nrow(high) == nrow(low))
     n <- nrow(high)
-    Dh <- as.matrix(stats::dist(high))
-    diag(Dh) <- Inf
+    ks_use <- ks[is.finite(ks) & ks >= 1L & ks < n]
+    if (!length(ks_use)) stop("No valid ks for trust/continuity at n=", n)
+
+    if (is.null(Rh)) {
+      Dh <- as.matrix(stats::dist(high))
+      diag(Dh) <- Inf
+      Rh <- rank_from_dist(Dh)
+    }
+
     Dl <- as.matrix(stats::dist(low))
     diag(Dl) <- Inf
-    
-    rf <- function(D) {
-      R <- matrix(0L, n, n)
-      for (i in 1:n) {
-        r <- D[i, ]
-        ord <- order(r)
-        R[i, ord] <- seq_len(n)
-      }
-      R
-    }
-    Rh <- rf(Dh)
-    Rl <- rf(Dl)
-    
-    res <- lapply(ks, function(k) {
+    Rl <- rank_from_dist(Dl)
+
+    res <- lapply(ks_use, function(k) {
       H <- t(apply(Rh, 1, function(r) order(r)[1:k]))
       L <- t(apply(Rl, 1, function(r) order(r)[1:k]))
       Tsum <- 0
       Csum <- 0
-      for (i in 1:n) {
+      for (i in seq_len(n)) {
         U <- setdiff(L[i, ], H[i, ])
         if (length(U)) Tsum <- Tsum + sum(pmax(Rh[i, U] - k, 0))
         V <- setdiff(H[i, ], L[i, ])
         if (length(V)) Csum <- Csum + sum(pmax(Rl[i, V] - k, 0))
       }
       denom <- n * k * (2 * n - 3 * k - 1)
+      if (!is.finite(denom) || denom <= 0) {
+        return(data.frame(k = k, Trust = NA_real_, Continuity = NA_real_))
+      }
       data.frame(k = k, Trust = 1 - (2 / denom) * Tsum, Continuity = 1 - (2 / denom) * Csum)
     })
     do.call(rbind, res)
   }
-  
+
+  Dh <- as.matrix(stats::dist(Xhigh))
+  diag(Dh) <- Inf
+  Rh <- rank_from_dist(Dh)
+
   vals <- lapply(2:mmax, function(m) {
-    tc <- trust_cont(Xhigh, Xlow_all[, 1:m, drop = FALSE], ks)
-    data.frame(m = m, T = mean(tc$Trust), C = mean(tc$Continuity))
+    tc <- trust_cont(Xhigh, Xlow_all[, 1:m, drop = FALSE], ks, Rh = Rh)
+    data.frame(m = m, T = mean(tc$Trust, na.rm = TRUE), C = mean(tc$Continuity, na.rm = TRUE))
   }) |> dplyr::bind_rows()
-  
+
   vals$score <- with(vals, (T + C) - lambda * (m - min(m)))
   vals$m[which.max(vals$score)]
 }
 
-m_f <- pick_m_via_tc(Ef, Bprime_all, ks = 10:30, mmax = ncol(Bprime_all), lambda = 0.02)
+pick_m_pool <- if (exists("reps") && length(reps) > 0L) reps else NULL
+m_f <- pick_m_via_tc(
+  Ef,
+  Bprime_all,
+  ks = 10:30,
+  mmax = ncol(Bprime_all),
+  lambda = 0.02,
+  max_n = DIAG_N_MAX,
+  pool_idx = pick_m_pool
+)
 Bprime <- Bprime_all[, 1:m_f, drop = FALSE]
 colnames(Bprime) <- paste0("f", seq_len(ncol(Bprime)))
 
 # OOF residuals of E on B' -> F' (linear)
-set.seed(SEED_PRED)
 Kf <- max(2L, min(CV_FOLDS, n))
-folds_f <- sample(rep(1:Kf, length.out = n))
+folds_f <- .with_seed(
+  .seed_from_key(SEED_PRED, "fprime_oof_folds"),
+  sample(rep(1:Kf, length.out = n))
+)
 
 residualise_linear_oof <- function(Y, X, folds) {
   n <- nrow(Y)
@@ -1217,7 +2157,26 @@ residualise_linear_oof <- function(Y, X, folds) {
 Fprime <- residualise_linear_oof(Ef, Bprime, folds_f)
 
 # ID diagnostics in residual spaces
-D_Bprime <- stats::dist(Bprime)
+resid_diag_from_reps <- exists("reps") && length(reps) > 0L
+resid_diag_pool <- if (resid_diag_from_reps) reps else seq_len(nrow(Bprime))
+resid_diag_n <- min(length(resid_diag_pool), DIAG_N_MAX)
+resid_diag_idx <- if (length(resid_diag_pool) > resid_diag_n) {
+  warn_diag_subsample(
+    "Resid-only",
+    resid_diag_n,
+    length(resid_diag_pool),
+    DIAG_N_MAX,
+    if (resid_diag_from_reps) "representatives" else "rows"
+  )
+  .with_seed(.seed_from_key(SEED_GLOBAL, "resid_space_diag_sample"), sample(resid_diag_pool, resid_diag_n))
+} else {
+  resid_diag_pool
+}
+
+if (length(resid_diag_idx) < 3L) resid_diag_idx <- seq_len(min(nrow(Bprime), 3L))
+
+Bprime_diag <- Bprime[resid_diag_idx, , drop = FALSE]
+D_Bprime <- stats::dist(Bprime_diag)
 MB <- as.matrix(D_Bprime)
 diag(MB) <- Inf
 core_B <- core_band_idx(D_Bprime, k = CORE_KNN_K, band = CORE_BAND)
@@ -1226,7 +2185,8 @@ ID_B_core <- if (length(core_B) >= 3) twonn_id_from_dist(stats::as.dist(MB[core_
 ID_B_LB <- if (length(core_B) >= 3) lb_mle_id(MB[core_B, core_B, drop = FALSE], 5, 15) else NA_real_
 
 if (ncol(Fprime) >= 2) {
-  D_Fprime <- stats::dist(Fprime)
+  Fprime_diag <- Fprime[resid_diag_idx, , drop = FALSE]
+  D_Fprime <- stats::dist(Fprime_diag)
   MFp <- as.matrix(D_Fprime)
   diag(MFp) <- Inf
   core_Fp <- core_band_idx(D_Fprime, k = CORE_KNN_K, band = CORE_BAND)
@@ -1257,6 +2217,7 @@ saveRDS(list(
   Bprime = Bprime,
   Fprime = Fprime,
   m_f = m_f,
+  diag_idx = resid_diag_idx,
   ID_Bprime = c(all = ID_B_all, core = ID_B_core, LB = ID_B_LB),
   ID_Fprime = c(all = ID_Fp_all, core = ID_Fp_core, LB = ID_Fp_LB),
   clusters = clF
@@ -1267,364 +2228,430 @@ cat("[Resid-only] wrote:", file.path(OUTPUTS_DIR, "residual_only_summary.rds"), 
 # ==============================================================================
 # 8. Predictive Diagnostics (OOF & Interactions)
 # ==============================================================================
-
-# Align dx labels to Base
-ids_base <- rownames(Base)
-stopifnot(length(ids_base) == nrow(Base), all(nzchar(ids_base)))
-
-DxW <- diag_wide_full %>%
-  dplyr::transmute(participant_id = 
-                     trimws(as.character(participant_id)),
-                   dplyr::across(-participant_id, ~ as.integer(.x))) %>%
-  dplyr::right_join(tibble::tibble(participant_id = ids_base, .row = seq_along(ids_base)), by = "participant_id") %>%
-  dplyr::arrange(.row) %>%
-  dplyr::select(-participant_id, -.row)
-DxW[is.na(DxW)] <- 0L
-
-prev <- colMeans(DxW > 0, na.rm = TRUE)
-cases <- colSums(DxW > 0, na.rm = TRUE)
-keep_dx <- names(prev)[(prev >= DX_PREV_MIN) & (cases >= DX_CASES_MIN)]
-
-if (!length(keep_dx)) {
-  warning("[dx] No diagnosis passes thresholds; skipping predictive diagnostics.")
-  keep_dx <- intersect(names(prev), names(prev)[cases > 0 & (1 - prev) * nrow(DxW) > 0])
-}
-DxW_A <- as.data.frame(DxW)[, keep_dx, drop = FALSE]
-rownames(DxW_A) <- ids_base
-
-# --- Diagnosis probability fields over Base ---
-dir.create(paste0(OUTPUTS_DIR, "/base_prob_grids"), showWarnings = FALSE)
-
-grid_from_base <- function(Base, nx = 140, ny = 140, pad = 0.05, q = c(0.01, 0.99)) {
-  rx <- quantile(Base[, 1], q, na.rm = TRUE)
-  ry <- quantile(Base[, 2], q, na.rm = TRUE)
-  wx <- diff(rx); wy <- diff(ry)
-  xs <- seq(rx[1] - pad * wx, rx[2] + pad * wx, length.out = nx)
-  ys <- seq(ry[1] - pad * wy, ry[2] + pad * wy, length.out = ny)
-  as.matrix(expand.grid(b1 = xs, b2 = ys))
-}
-
-predict_dx_surface <- function(y, Base, gridXY, k_gam = 30) {
-  df <- data.frame(y = as.integer(y), b1 = Base[, 1], b2 = Base[, 2])
-  fit <- try(mgcv::gam(y ~ s(b1, b2, k = k_gam), data = df, family = binomial(), method = "REML"), silent = TRUE)
-  if (inherits(fit, "try-error")) return(NULL)
+if (DX_AVAILABLE) {
+  # Align dx labels to Base
+  ids_base <- rownames(Base)
+  stopifnot(length(ids_base) == nrow(Base), all(nzchar(ids_base)))
   
-  pg <- try(as.numeric(predict(fit,
-                               newdata = data.frame(
-                                 b1 = gridXY[, 1],
-                                 b2 = gridXY[, 2]),
-                               type = "response")),
-            silent = TRUE)
+  DxW <- diag_wide_full %>%
+    dplyr::transmute(participant_id = 
+                       trimws(as.character(participant_id)),
+                     dplyr::across(-participant_id, ~ as.integer(.x))) %>%
+    dplyr::right_join(tibble::tibble(participant_id = ids_base, .row = seq_along(ids_base)), by = "participant_id") %>%
+    dplyr::arrange(.row) %>%
+    dplyr::select(-participant_id, -.row)
+  DxW[is.na(DxW)] <- 0L
   
-  if (inherits(pg, "try-error")) return(NULL)
-  pmin(pmax(pg, 1e-6), 1 - 1e-6)
-}
-
-make_fname_safe <- function(x, max_len = 80) {
-  s <- iconv(as.character(x), to = "ASCII//TRANSLIT")
-  s <- tolower(s)
-  s <- gsub("[^a-z0-9]+", "_", s)
-  s <- gsub("^_+|_+$", "", s)
-  s <- substr(s, 1, max_len)
-  if (!nzchar(s)) s <- "dx"
-  s
-}
-
-gridXY <- grid_from_base(Base, nx = as.integer(BF_NGR_UV), ny = as.integer(BF_NGR_UV))
-dx_surface_files <- c()
-
-for (dx in names(DxW_A)) {
-  y <- as.integer(DxW_A[[dx]] > 0)
-  pg <- predict_dx_surface(y, Base, gridXY, k_gam = 30)
-  if (is.null(pg)) {
-    warning(sprintf("[base-field] skip dx=%s (fit failed).", dx))
-    next
+  prev <- colMeans(DxW > 0, na.rm = TRUE)
+  cases <- colSums(DxW > 0, na.rm = TRUE)
+  keep_dx <- names(prev)[(prev >= DX_PREV_MIN) & (cases >= DX_CASES_MIN)]
+  
+  if (!length(keep_dx)) {
+    warning("[dx] No diagnosis passes thresholds; skipping predictive diagnostics.")
+    keep_dx <- intersect(names(prev), names(prev)[cases > 0 & (1 - prev) * nrow(DxW) > 0])
   }
-  out <- data.frame(b1 = gridXY[, 1], b2 = gridXY[, 2], p = pg, dx = dx)
-  fp <- file.path(paste0(OUTPUTS_DIR, "/base_prob_grids"), paste0("probgrid_", make_fname_safe(dx), ".csv"))
-  write_csv(out, fp)
-  dx_surface_files <- c(dx_surface_files, fp)
-}
-cat(sprintf("[base-field] wrote %d grid(s) to %s\n", length(dx_surface_files), paste0(OUTPUTS_DIR, "/base_prob_grids/")))
-
-# --- Item x Diagnosis Interactions (Parallelized OOF GAM) ---
-
-vars_item_interact <- unique(varmap)
-n_probe_count <- if (exists("N_TOP_PER_DX")) N_TOP_PER_DX else 50
-vars_probe <- head(vars_item_interact, min(n_probe_count, length(vars_item_interact)))
-
-# Pre-calculate scaled matrix for speed
-if (!exists("Z0_std")) Z0_std <- scale(Xenc, center = TRUE, scale = TRUE)
-
-task_grid <- expand.grid(
-  dx = names(DxW_A), 
-  var = vars_probe, 
-  stringsAsFactors = FALSE
-)
-
-# Filter rare diagnoses for stability
-dx_counts <- colSums(DxW_A > 0, na.rm = TRUE)
-valid_dx <- names(dx_counts)[dx_counts >= 6]
-task_grid <- task_grid[task_grid$dx %in% valid_dx, , drop = FALSE]
-
-cat(sprintf("[Interactions] Parallelizing %d tasks (%d items x %d diagnoses)...\n", 
-            nrow(task_grid), length(unique(task_grid$var)), length(unique(task_grid$dx))))
-
-# Helper Helpers
-choose_K_dx <- function(y, K_target = 5L, min_per_class = 6L) {
-  y <- as.integer(y > 0)
-  n1 <- sum(y == 1); n0 <- sum(y == 0)
-  max(2L, min(K_target, floor(n1 / min_per_class), floor(n0 / min_per_class)))
-}
-
-oof_R2_two_gams <- function(v, Base, dx, K_target = 5, k_gam = 10, seed = SEED_GLOBAL) {
-  n <- length(v)
-  if (n != nrow(Base) || n != length(dx)) {
-    return(c(R2_add = NA, R2_int = NA, p_like = NA, dR2 = NA))
+  DxW_A <- as.data.frame(DxW)[, keep_dx, drop = FALSE]
+  rownames(DxW_A) <- ids_base
+  
+  # --- Diagnosis probability fields over Base ---
+  dir.create(paste0(OUTPUTS_DIR, "/base_prob_grids"), showWarnings = FALSE)
+  
+  grid_from_base <- function(Base, nx = 140, ny = 140, pad = 0.05, q = c(0.01, 0.99)) {
+    rx <- quantile(Base[, 1], q, na.rm = TRUE)
+    ry <- quantile(Base[, 2], q, na.rm = TRUE)
+    wx <- diff(rx); wy <- diff(ry)
+    xs <- seq(rx[1] - pad * wx, rx[2] + pad * wx, length.out = nx)
+    ys <- seq(ry[1] - pad * wy, ry[2] + pad * wy, length.out = ny)
+    as.matrix(expand.grid(b1 = xs, b2 = ys))
   }
   
-  K <- choose_K_dx(dx, K_target = K_target, min_per_class = 6L)
-  if (K < 2) return(c(R2_add = NA, R2_int = NA, p_like = NA, dR2 = NA))
+  predict_dx_surface <- function(y, Base, gridXY, k_gam = 30) {
+    df <- data.frame(y = as.integer(y), b1 = Base[, 1], b2 = Base[, 2])
+    fit <- try(mgcv::gam(y ~ s(b1, b2, k = k_gam), data = df, family = binomial(), method = "REML"), silent = TRUE)
+    if (inherits(fit, "try-error")) return(NULL)
+    
+    pg <- try(as.numeric(predict(fit,
+                                 newdata = data.frame(
+                                   b1 = gridXY[, 1],
+                                   b2 = gridXY[, 2]),
+                                 type = "response")),
+              silent = TRUE)
+    
+    if (inherits(pg, "try-error")) return(NULL)
+    pmin(pmax(pg, 1e-6), 1 - 1e-6)
+  }
   
-  set.seed(seed)
-  fold_id <- sample(rep(1:K, length.out = n))
-  lev_all <- levels(factor(dx))
+  make_fname_safe <- function(x, max_len = 80) {
+    s <- iconv(as.character(x), to = "ASCII//TRANSLIT")
+    s <- tolower(s)
+    s <- gsub("[^a-z0-9]+", "_", s)
+    s <- gsub("^_+|_+$", "", s)
+    s <- substr(s, 1, max_len)
+    if (!nzchar(s)) s <- "dx"
+    s
+  }
   
-  y_add <- rep(NA_real_, n)
-  y_int <- rep(NA_real_, n)
+  gridXY <- grid_from_base(Base, nx = as.integer(BF_NGR_UV), ny = as.integer(BF_NGR_UV))
+  dx_surface_files <- c()
   
-  # Note: Force single-threaded GAM fitting here since we are inside parallel loop
-  ctrl <- mgcv::gam.control(maxit = 100, nthreads = 1)
-  
-  for (k in sort(unique(fold_id))) {
-    tr <- which(fold_id != k)
-    te <- which(fold_id == k)
-    if (length(tr) < 10 || length(te) == 0) next 
-    
-    dtr <- data.frame(v = v[tr], b1 = Base[tr, 1], b2 = Base[tr, 2], dx = factor(dx[tr], levels = lev_all))
-    dte <- data.frame(b1 = Base[te, 1], b2 = Base[te, 2], dx = factor(dx[te], levels = lev_all))
-    
-    # 1. Additive Model
-    f_add <- try(mgcv::gam(v ~ s(b1, b2, k = k_gam, bs = "tp", m = 2),
-                           data = dtr, method = "REML", gamma = 1.4, control = ctrl), silent = TRUE)
-    
-    # 2. Interaction Model
-    f_int <- try(mgcv::gam(v ~ s(b1, b2, k = k_gam, bs = "tp", m = 2) + 
-                             dx +
-                             s(b1, b2, by = dx, k = k_gam, bs = "tp", m = 2),
-                           data = dtr, method = "REML", select = TRUE, gamma = 1.4, control = ctrl), silent = TRUE)
-    
-    mu <- mean(dtr$v, na.rm = TRUE)
-    
-    if (!inherits(f_add, "try-error")) {
-      pa <- try(predict(f_add, newdata = dte, type = "response"), silent = TRUE)
-      if (!inherits(pa, "try-error")) y_add[te] <- as.numeric(pa)
+  for (dx in names(DxW_A)) {
+    y <- as.integer(DxW_A[[dx]] > 0)
+    pg <- predict_dx_surface(y, Base, gridXY, k_gam = 30)
+    if (is.null(pg)) {
+      warning(sprintf("[base-field] skip dx=%s (fit failed).", dx))
+      next
     }
-    
-    if (!inherits(f_int, "try-error")) {
-      pi <- try(predict(f_int, newdata = dte, type = "response"), silent = TRUE)
-      if (!inherits(pi, "try-error")) y_int[te] <- as.numeric(pi)
-    }
-    
-    if (any(!is.finite(y_add[te]))) y_add[te][!is.finite(y_add[te])] <- mu
-    if (any(!is.finite(y_int[te]))) y_int[te][!is.finite(y_int[te])] <- mu
+    out <- data.frame(b1 = gridXY[, 1], b2 = gridXY[, 2], p = pg, dx = dx)
+    fp <- file.path(paste0(OUTPUTS_DIR, "/base_prob_grids"), paste0("probgrid_", make_fname_safe(dx), ".csv"))
+    write_csv(out, fp)
+    dx_surface_files <- c(dx_surface_files, fp)
   }
+  cat(sprintf("[base-field] wrote %d grid(s) to %s\n", length(dx_surface_files), paste0(OUTPUTS_DIR, "/base_prob_grids/")))
   
-  ve <- stats::var(v, na.rm = TRUE)
-  if (!is.finite(ve) || ve <= 0) return(c(R2_add = NA, R2_int = NA, p_like = NA, dR2 = NA))
+  # --- Item x Diagnosis Interactions (Parallelized OOF GAM) ---
   
-  R2_add <- max(0, 1 - mean((v - y_add)^2, na.rm = TRUE) / ve)
-  R2_int <- max(0, 1 - mean((v - y_int)^2, na.rm = TRUE) / ve)
+  vars_item_interact <- unique(varmap)
+  n_probe_count <- if (exists("N_TOP_PER_DX")) N_TOP_PER_DX else 50
+  vars_probe <- head(vars_item_interact, min(n_probe_count, length(vars_item_interact)))
   
-  d_sq <- (v - y_add)^2 - (v - y_int)^2
-  d_sq <- d_sq[is.finite(d_sq)]
+  # Pre-calculate scaled matrix for speed
+  if (!exists("Z0_std")) Z0_std <- scale(Xenc, center = TRUE, scale = TRUE)
   
-  p_like <- if (length(d_sq) < 10L || all(abs(d_sq) < .Machine$double.eps)) NA_real_ else 
-    tryCatch(stats::wilcox.test(d_sq, mu = 0, alternative = "greater", exact = FALSE)$p.value,
-             error = function(e) NA_real_)
-  
-  c(R2_add = R2_add, R2_int = R2_int, p_like = p_like, dR2 = R2_int - R2_add)
-}
-
-# Execute Parallel Loop
-rows <- progressr::with_progress({
-  p <- progressr::progressor(steps = nrow(task_grid))
-  
-  FUTURE_LAPPLY(
-    seq_len(nrow(task_grid)),
-    function(i) {
-      out <- interact_worker(i, task_grid, Z0_std, Base, DxW_A, varmap)
-      p() 
-      out
-    },
-    future.globals = list(
-      task_grid = task_grid, Z0_std = Z0_std, Base = Base, DxW_A = DxW_A, varmap = varmap,
-      score_item_base = score_item_base, oof_R2_two_gams = oof_R2_two_gams,
-      choose_K_dx = choose_K_dx, interact_worker = interact_worker, p = p
-    ),
-    future.packages = c("mgcv", "stats"),
-    future.seed = TRUE,
-    future.scheduling = 1  # Force 1 item per worker at a time
+  task_grid <- expand.grid(
+    dx = names(DxW_A), 
+    var = vars_probe, 
+    stringsAsFactors = FALSE
   )
-})
-
-# Aggregate Results
-rows <- Filter(Negate(is.null), rows)
-
-if (length(rows) > 0) {
-  int_tbl <- dplyr::bind_rows(rows) %>% dplyr::filter(is.finite(dR2), is.finite(p_like))
   
-  if (nrow(int_tbl) > 0) {
-    int_tbl <- int_tbl %>%
-      dplyr::group_by(dx) %>%
-      dplyr::mutate(q_like = p.adjust(p_like, method = "BH")) %>%
-      dplyr::ungroup() %>%
-      dplyr::mutate(sig = q_like < SIG_Q) %>%
-      dplyr::arrange(dplyr::desc(dR2))
+  # Filter rare diagnoses for stability
+  dx_counts <- colSums(DxW_A > 0, na.rm = TRUE)
+  valid_dx <- names(dx_counts)[dx_counts >= 6]
+  task_grid <- task_grid[task_grid$dx %in% valid_dx, , drop = FALSE]
+  
+  cat(sprintf("[Interactions] Parallelizing %d tasks (%d items x %d diagnoses)...\n", 
+              nrow(task_grid), length(unique(task_grid$var)), length(unique(task_grid$dx))))
+  
+  # Helper Helpers
+  choose_K_dx <- function(y, K_target = 5L, min_per_class = 6L) {
+    y <- as.integer(y > 0)
+    n1 <- sum(y == 1); n0 <- sum(y == 0)
+    max(2L, min(K_target, floor(n1 / min_per_class), floor(n0 / min_per_class)))
+  }
+  
+  oof_R2_two_gams <- function(v, Base, dx, K_target = 5, k_gam = 10,
+                              seed = SEED_GLOBAL, seed_key = NULL) {
+    n <- length(v)
+    if (n != nrow(Base) || n != length(dx)) {
+      return(c(R2_add = NA, R2_int = NA, p_like = NA, dR2 = NA))
+    }
     
-    write_csv(int_tbl, "item_dx_interactions.csv")
-    cat(sprintf("[interactions] wrote: %s (rows=%d)\n", "item_dx_interactions.csv", nrow(int_tbl)))
+    K <- choose_K_dx(dx, K_target = K_target, min_per_class = 6L)
+    if (K < 2) return(c(R2_add = NA, R2_int = NA, p_like = NA, dR2 = NA))
+    
+    seed_eff <- if (is.null(seed_key)) {
+      as.integer(seed)
+    } else {
+      .seed_from_key(seed, paste0("oof_gam|", seed_key))
+    }
+    fold_id <- .with_seed(seed_eff, sample(rep(1:K, length.out = n)))
+    lev_all <- levels(factor(dx))
+    
+    y_add <- rep(NA_real_, n)
+    y_int <- rep(NA_real_, n)
+    
+    # Note: Force single-threaded GAM fitting here since we are inside parallel loop
+    ctrl <- mgcv::gam.control(maxit = 100, nthreads = 1)
+    
+    for (k in sort(unique(fold_id))) {
+      tr <- which(fold_id != k)
+      te <- which(fold_id == k)
+      if (length(tr) < 10 || length(te) == 0) next 
+      
+      dtr <- data.frame(v = v[tr], b1 = Base[tr, 1], b2 = Base[tr, 2], dx = factor(dx[tr], levels = lev_all))
+      dte <- data.frame(b1 = Base[te, 1], b2 = Base[te, 2], dx = factor(dx[te], levels = lev_all))
+      
+      # 1. Additive Model
+      f_add <- try(mgcv::gam(v ~ s(b1, b2, k = k_gam, bs = "tp", m = 2),
+                             data = dtr, method = "REML", gamma = 1.4, control = ctrl), silent = TRUE)
+      
+      # 2. Interaction Model
+      f_int <- try(mgcv::gam(v ~ s(b1, b2, k = k_gam, bs = "tp", m = 2) + 
+                               dx +
+                               s(b1, b2, by = dx, k = k_gam, bs = "tp", m = 2),
+                             data = dtr, method = "REML", select = TRUE, gamma = 1.4, control = ctrl), silent = TRUE)
+      
+      mu <- mean(dtr$v, na.rm = TRUE)
+      
+      if (!inherits(f_add, "try-error")) {
+        pa <- try(predict(f_add, newdata = dte, type = "response"), silent = TRUE)
+        if (!inherits(pa, "try-error")) y_add[te] <- as.numeric(pa)
+      }
+      
+      if (!inherits(f_int, "try-error")) {
+        pi <- try(predict(f_int, newdata = dte, type = "response"), silent = TRUE)
+        if (!inherits(pi, "try-error")) y_int[te] <- as.numeric(pi)
+      }
+      
+      if (any(!is.finite(y_add[te]))) y_add[te][!is.finite(y_add[te])] <- mu
+      if (any(!is.finite(y_int[te]))) y_int[te][!is.finite(y_int[te])] <- mu
+    }
+    
+    ve <- stats::var(v, na.rm = TRUE)
+    if (!is.finite(ve) || ve <= 0) return(c(R2_add = NA, R2_int = NA, p_like = NA, dR2 = NA))
+    
+    R2_add <- max(0, 1 - mean((v - y_add)^2, na.rm = TRUE) / ve)
+    R2_int <- max(0, 1 - mean((v - y_int)^2, na.rm = TRUE) / ve)
+    
+    d_sq <- (v - y_add)^2 - (v - y_int)^2
+    d_sq <- d_sq[is.finite(d_sq)]
+    
+    p_like <- if (length(d_sq) < 10L || all(abs(d_sq) < .Machine$double.eps)) NA_real_ else 
+      tryCatch(stats::wilcox.test(d_sq, mu = 0, alternative = "greater", exact = FALSE)$p.value,
+               error = function(e) NA_real_)
+    
+    c(R2_add = R2_add, R2_int = R2_int, p_like = p_like, dR2 = R2_int - R2_add)
+  }
+  
+  # Execute Parallel Loop
+  n_workers_interact <- tryCatch(as.integer(future::nbrOfWorkers()), error = function(e) 1L)
+  worker_parent <- new.env(parent = globalenv())
+  score_item_base_core <- score_item_base
+  environment(score_item_base_core) <- worker_parent
+
+  choose_K_dx_core <- choose_K_dx
+  environment(choose_K_dx_core) <- worker_parent
+
+  hash32_core <- .hash32
+  environment(hash32_core) <- worker_parent
+
+  seed_from_key_core <- .seed_from_key
+  environment(seed_from_key_core) <- list2env(
+    list(.hash32 = hash32_core),
+    parent = worker_parent
+  )
+
+  with_seed_core <- .with_seed
+  environment(with_seed_core) <- worker_parent
+
+  oof_R2_two_gams_core <- oof_R2_two_gams
+  environment(oof_R2_two_gams_core) <- list2env(
+    list(
+      choose_K_dx = choose_K_dx_core,
+      .seed_from_key = seed_from_key_core,
+      .with_seed = with_seed_core,
+      SEED_GLOBAL = SEED_GLOBAL
+    ),
+    parent = worker_parent
+  )
+
+  interact_worker_core <- interact_worker
+  environment(interact_worker_core) <- list2env(
+    list(
+      score_item_base = score_item_base_core,
+      oof_R2_two_gams = oof_R2_two_gams_core,
+      SEED_GLOBAL = SEED_GLOBAL
+    ),
+    parent = worker_parent
+  )
+  interact_worker_env <- list2env(
+    list(
+      task_grid = task_grid,
+      Z0_std = Z0_std,
+      Base = Base,
+      DxW_A = DxW_A,
+      varmap = varmap,
+      interact_worker_core = interact_worker_core
+    ),
+    parent = worker_parent
+  )
+  interact_task <- function(i) {
+    interact_worker_core(i, task_grid, Z0_std, Base, DxW_A, varmap)
+  }
+  environment(interact_task) <- interact_worker_env
+
+  if (n_workers_interact <= 1L) {
+    pb <- utils::txtProgressBar(min = 0, max = nrow(task_grid), style = 3)
+    on.exit(try(close(pb), silent = TRUE), add = TRUE)
+    rows <- lapply(seq_len(nrow(task_grid)), function(i) {
+      out <- interact_task(i)
+      utils::setTxtProgressBar(pb, i)
+      out
+    })
   } else {
-    warning("[interactions] Table empty after filtering.")
+    rows <- FUTURE_LAPPLY(
+      seq_len(nrow(task_grid)),
+      interact_task,
+      future.packages = c("mgcv", "stats"),
+      future.seed = TRUE,
+      future.scheduling = 1
+    )
+  }
+  
+  # Aggregate Results
+  rows <- Filter(Negate(is.null), rows)
+  
+  if (length(rows) > 0) {
+    int_tbl <- dplyr::bind_rows(rows) %>% dplyr::filter(is.finite(dR2), is.finite(p_like))
+    
+    if (nrow(int_tbl) > 0) {
+      int_tbl <- int_tbl %>%
+        dplyr::group_by(dx) %>%
+        dplyr::mutate(q_like = p.adjust(p_like, method = "BH")) %>%
+        dplyr::ungroup() %>%
+        dplyr::mutate(sig = q_like < SIG_Q) %>%
+        dplyr::arrange(dplyr::desc(dR2))
+      
+      write_csv(int_tbl, "item_dx_interactions.csv")
+      cat(sprintf("[interactions] wrote: %s (rows=%d)\n", "item_dx_interactions.csv", nrow(int_tbl)))
+    } else {
+      warning("[interactions] Table empty after filtering.")
+    }
+  } else {
+    warning("[interactions] No valid interactions computed.")
   }
 } else {
-  warning("[interactions] No valid interactions computed.")
+  message("[dx] Section 8 (predictive diagnostics & interactions) disabled: DX set as optional (setup.R)")
 }
 
 # ==============================================================================
 # 9. Outputs and Session
 # ==============================================================================
 
-# Cluster Summaries
-kF <- length(unique(clF))
-cat(sprintf("[clusters] using %d clusters.\n", kF))
+if (DX_AVAILABLE && !is.null(DX_wide) && ncol(DX_wide) > 0) {
 
-clusters <- sort(unique(clF))
-cl_fac <- factor(clF, levels = clusters)
-
-mean_by_cluster <- function(vec, clf) {
-  out <- tapply(vec, clf, function(z) mean(z, na.rm = TRUE))
-  as.numeric(out)
-}
-
-n_by_cluster <- as.integer(tabulate(cl_fac))
-base_means <- cbind(b1_mean = mean_by_cluster(Base[, 1], cl_fac), b2_mean = mean_by_cluster(Base[, 2], cl_fac))
-
-f_means <- sapply(seq_len(ncol(Bprime)), function(j) mean_by_cluster(Bprime[, j], cl_fac))
-if (!is.null(dim(f_means))) {
-  colnames(f_means) <- paste0("f", seq_len(ncol(Bprime)), "_mean")
-} else {
-  f_means <- cbind(`f1_mean` = as.numeric(f_means))
-}
-
-sum_tbl <- data.frame(cluster = clusters, n = n_by_cluster, base_means, check.names = FALSE, stringsAsFactors = FALSE)
-if (!is.null(f_means)) {
-  f_means <- as.matrix(f_means)
-  storage.mode(f_means) <- "double"
-  sum_tbl <- cbind(sum_tbl, f_means, stringsAsFactors = FALSE)
-}
-write_csv(sum_tbl, "cluster_summary.csv")
-
-# Cluster Enrichment Analysis
-DxW2 <- DxW_A
-DxW2[is.na(DxW2)] <- 0L
-prev2 <- colSums(DxW2 > 0L, na.rm = TRUE)
-keepc <- prev2 >= max(DX_CASES_MIN, ceiling(0.01 * nrow(DxW2)))
-DxW2 <- DxW2[, keepc, drop = FALSE]
-
-if (ncol(DxW2) > 0) {
-  tab <- sapply(colnames(DxW2), function(dn) {
-    tapply(DxW2[[dn]] > 0L, factor(clF, levels = clusters), sum, na.rm = TRUE)
-  })
-  tab <- as.matrix(tab)
-  storage.mode(tab) <- "double"
-  rownames(tab) <- as.character(clusters)
+  # Cluster Summaries
+  kF <- length(unique(clF))
+  cat(sprintf("[clusters] using %d clusters.\n", kF))
   
-  suppressWarnings({
-    chi <- try(chisq.test(tab), silent = TRUE)
-  })
+  clusters <- sort(unique(clF))
+  cl_fac <- factor(clF, levels = clusters)
   
-  if (inherits(chi, "try-error")) {
-    Eexp_used <- outer(rowSums(tab), colSums(tab), function(r, c) r * c / max(sum(tab), 1))
-    Z_enrich <- (tab - Eexp_used) / sqrt(pmax(Eexp_used, 1e-9))
-    pmat <- 2 * pnorm(-abs(Z_enrich))
-  } else {
-    Z_enrich <- chi$stdres
-    Eexp_used <- chi$expected
-    pmat <- 2 * pnorm(-abs(Z_enrich))
+  mean_by_cluster <- function(vec, clf) {
+    out <- tapply(vec, clf, function(z) mean(z, na.rm = TRUE))
+    as.numeric(out)
   }
   
-  # BH corrections
-  q_by_dx <- apply(pmat, 2, function(p) p.adjust(p, method = "BH"))
-  q_global <- p.adjust(as.vector(pmat), method = "BH")
-  q_global_mat <- matrix(
-    q_global,
-    nrow = nrow(pmat), ncol = ncol(pmat),
-    byrow = FALSE, dimnames = dimnames(pmat)
-  )
+  n_by_cluster <- as.integer(tabulate(cl_fac))
+  base_means <- cbind(b1_mean = mean_by_cluster(Base[, 1], cl_fac), b2_mean = mean_by_cluster(Base[, 2], cl_fac))
   
-  # Prevalences
-  ncl <- as.integer(tabulate(factor(clF, levels = clusters)))
-  names(ncl) <- as.character(clusters)
-  prev_in_cluster <- sweep(tab, 1, ncl, "/")
-  prev_overall <- colSums(DxW2 > 0L) / nrow(DxW2)
+  f_means <- sapply(seq_len(ncol(Bprime)), function(j) mean_by_cluster(Bprime[, j], cl_fac))
+  if (!is.null(dim(f_means))) {
+    colnames(f_means) <- paste0("f", seq_len(ncol(Bprime)), "_mean")
+  } else {
+    f_means <- cbind(`f1_mean` = as.numeric(f_means))
+  }
   
-  # Export wide matrices
-  write_csv(data.frame(cluster = rownames(Z_enrich), as.data.frame(Z_enrich), check.names = FALSE), "dx_cluster_enrichment_Z.csv")
-  write_csv(data.frame(cluster = rownames(pmat), as.data.frame(pmat), check.names = FALSE), "dx_cluster_enrichment_p.csv")
-  write_csv(data.frame(cluster = rownames(q_by_dx), as.data.frame(q_by_dx), check.names = FALSE), "dx_cluster_enrichment_q_by_dx.csv")
-  write_csv(data.frame(cluster = rownames(q_global_mat), as.data.frame(q_global_mat), check.names = FALSE), "dx_cluster_enrichment_q_global.csv")
-  write_csv(data.frame(cluster = rownames(prev_in_cluster), as.data.frame(prev_in_cluster), check.names = FALSE), "dx_cluster_prev_in_cluster.csv")
+  sum_tbl <- data.frame(cluster = clusters, n = n_by_cluster, base_means, check.names = FALSE, stringsAsFactors = FALSE)
+  if (!is.null(f_means)) {
+    f_means <- as.matrix(f_means)
+    storage.mode(f_means) <- "double"
+    sum_tbl <- cbind(sum_tbl, f_means, stringsAsFactors = FALSE)
+  }
+  write_csv(sum_tbl, "cluster_summary.csv")
   
-  # Export Long table
-  grid <- expand.grid(
-    cluster = rownames(tab),
-    dx = colnames(tab),
-    stringsAsFactors = FALSE
-  )
-  idx_r <- match(grid$cluster, rownames(tab))
-  idx_c <- match(grid$dx, colnames(tab))
+  # Cluster Enrichment Analysis
+  DxW2 <- DxW_A
+  DxW2[is.na(DxW2)] <- 0L
+  prev2 <- colSums(DxW2 > 0L, na.rm = TRUE)
+  keepc <- prev2 >= max(DX_CASES_MIN, ceiling(0.01 * nrow(DxW2)))
+  DxW2 <- DxW2[, keepc, drop = FALSE]
   
-  grid$n_cluster <- ncl[grid$cluster]
-  grid$cases_cluster <- tab[cbind(idx_r, idx_c)]
-  grid$prev_cluster <- prev_in_cluster[cbind(idx_r, idx_c)]
-  grid$prev_overall <- prev_overall[grid$dx]
-  grid$Z <- Z_enrich[cbind(idx_r, idx_c)]
-  grid$p <- pmat[cbind(idx_r, idx_c)]
-  grid$q_by_dx <- q_by_dx[cbind(idx_r, idx_c)]
-  grid$q_global <- q_global_mat[cbind(idx_r, idx_c)]
-  grid$expected_cases <- Eexp_used[cbind(idx_r, idx_c)]
-  grid$enriched <- (grid$Z > 0) & (grid$q_by_dx < SIG_Q)
-  
-  grid <- grid[order(-grid$Z, grid$q_by_dx, grid$dx, as.integer(grid$cluster)), ]
-  write_csv(grid, "dx_cluster_enrichment_long.csv")
-  
-  if (requireNamespace("ggplot2", quietly = TRUE)) {
-    # Cap Z for display
-    Zcap <- pmax(pmin(Z_enrich, 5), -5)
-    z_long <- data.frame(
-      cluster = rep(rownames(Zcap), times = ncol(Zcap)),
-      dx = rep(colnames(Zcap), each = nrow(Zcap)),
-      Z = as.vector(Zcap),
+  if (ncol(DxW2) > 0) {
+    tab <- sapply(colnames(DxW2), function(dn) {
+      tapply(DxW2[[dn]] > 0L, factor(clF, levels = clusters), sum, na.rm = TRUE)
+    })
+    tab <- as.matrix(tab)
+    storage.mode(tab) <- "double"
+    rownames(tab) <- as.character(clusters)
+    
+    suppressWarnings({
+      chi <- try(chisq.test(tab), silent = TRUE)
+    })
+    
+    if (inherits(chi, "try-error")) {
+      Eexp_used <- outer(rowSums(tab), colSums(tab), function(r, c) r * c / max(sum(tab), 1))
+      Z_enrich <- (tab - Eexp_used) / sqrt(pmax(Eexp_used, 1e-9))
+      pmat <- 2 * pnorm(-abs(Z_enrich))
+    } else {
+      Z_enrich <- chi$stdres
+      Eexp_used <- chi$expected
+      pmat <- 2 * pnorm(-abs(Z_enrich))
+    }
+    
+    # BH corrections
+    q_by_dx <- apply(pmat, 2, function(p) p.adjust(p, method = "BH"))
+    q_global <- p.adjust(as.vector(pmat), method = "BH")
+    q_global_mat <- matrix(
+      q_global,
+      nrow = nrow(pmat), ncol = ncol(pmat),
+      byrow = FALSE, dimnames = dimnames(pmat)
+    )
+    
+    # Prevalences
+    ncl <- as.integer(tabulate(factor(clF, levels = clusters)))
+    names(ncl) <- as.character(clusters)
+    prev_in_cluster <- sweep(tab, 1, ncl, "/")
+    prev_overall <- colSums(DxW2 > 0L) / nrow(DxW2)
+    
+    # Export wide matrices
+    write_csv(data.frame(cluster = rownames(Z_enrich), as.data.frame(Z_enrich), check.names = FALSE), "dx_cluster_enrichment_Z.csv")
+    write_csv(data.frame(cluster = rownames(pmat), as.data.frame(pmat), check.names = FALSE), "dx_cluster_enrichment_p.csv")
+    write_csv(data.frame(cluster = rownames(q_by_dx), as.data.frame(q_by_dx), check.names = FALSE), "dx_cluster_enrichment_q_by_dx.csv")
+    write_csv(data.frame(cluster = rownames(q_global_mat), as.data.frame(q_global_mat), check.names = FALSE), "dx_cluster_enrichment_q_global.csv")
+    write_csv(data.frame(cluster = rownames(prev_in_cluster), as.data.frame(prev_in_cluster), check.names = FALSE), "dx_cluster_prev_in_cluster.csv")
+    
+    # Export Long table
+    grid <- expand.grid(
+      cluster = rownames(tab),
+      dx = colnames(tab),
       stringsAsFactors = FALSE
     )
-    gp <- ggplot2::ggplot(z_long, ggplot2::aes(x = dx, y = factor(cluster))) +
-      ggplot2::geom_tile(ggplot2::aes(fill = Z)) +
-      ggplot2::scale_fill_gradient2() +
-      ggplot2::labs(
-        x = "Diagnosis", y = "Cluster", fill = "Z (std. resid.)",
-        title = "Diagnosis enrichment by cluster (std. residuals)"
-      ) +
-      ggplot2::theme_minimal() +
-      ggplot2::theme(axis.text.x = ggplot2::element_text(angle = 45, hjust = 1))
-    print(gp)
-    save_plot_gg("FIG_dx_cluster_enrichment_heatmap.png",
-                 gp,
-                 width = 10, height = 6, dpi = 150
-    )
+    idx_r <- match(grid$cluster, rownames(tab))
+    idx_c <- match(grid$dx, colnames(tab))
+    
+    grid$n_cluster <- ncl[grid$cluster]
+    grid$cases_cluster <- tab[cbind(idx_r, idx_c)]
+    grid$prev_cluster <- prev_in_cluster[cbind(idx_r, idx_c)]
+    grid$prev_overall <- prev_overall[grid$dx]
+    grid$Z <- Z_enrich[cbind(idx_r, idx_c)]
+    grid$p <- pmat[cbind(idx_r, idx_c)]
+    grid$q_by_dx <- q_by_dx[cbind(idx_r, idx_c)]
+    grid$q_global <- q_global_mat[cbind(idx_r, idx_c)]
+    grid$expected_cases <- Eexp_used[cbind(idx_r, idx_c)]
+    grid$enriched <- (grid$Z > 0) & (grid$q_by_dx < SIG_Q)
+    
+    grid <- grid[order(-grid$Z, grid$q_by_dx, grid$dx, as.integer(grid$cluster)), ]
+    write_csv(grid, "dx_cluster_enrichment_long.csv")
+    
+    if (requireNamespace("ggplot2", quietly = TRUE)) {
+      # Cap Z for display
+      Zcap <- pmax(pmin(Z_enrich, 5), -5)
+      z_long <- data.frame(
+        cluster = rep(rownames(Zcap), times = ncol(Zcap)),
+        dx = rep(colnames(Zcap), each = nrow(Zcap)),
+        Z = as.vector(Zcap),
+        stringsAsFactors = FALSE
+      )
+      gp <- ggplot2::ggplot(z_long, ggplot2::aes(x = dx, y = factor(cluster))) +
+        ggplot2::geom_tile(ggplot2::aes(fill = Z)) +
+        ggplot2::scale_fill_gradient2() +
+        ggplot2::labs(
+          x = "Diagnosis", y = "Cluster", fill = "Z (std. resid.)",
+          title = "Diagnosis enrichment by cluster (std. residuals)"
+        ) +
+        ggplot2::theme_minimal() +
+        ggplot2::theme(axis.text.x = ggplot2::element_text(angle = 45, hjust = 1))
+      print(gp)
+      save_plot_gg("FIG_dx_cluster_enrichment_heatmap.png",
+                   gp,
+                   width = 10, height = 6, dpi = 150
+      )
+    }
+  } else {
+    warning("[clusters] No Dx columns after filtering for enrichment; skipped.")
   }
 } else {
-  warning("[clusters] No Dx columns after filtering for enrichment; skipped.")
+  message("[dx] Enrichment by diagnosis disabled: DX set as optional.")
 }
 
 # ------------------------------------------------------------------------------
@@ -1748,23 +2775,23 @@ Z_A    <- Z
 # Geometry & grids
 geom <- build_geometry(Base_A)
 
-# Export Embeddings
-emb_base <- data.frame(
+# Export PC score tables
+pc_scores_base <- data.frame(
   participant_id = ids_base,
   b1 = Base[, 1], b2 = Base[, 2],
   cluster = as.integer(clF),
   target = as.integer(y_use),
   stringsAsFactors = FALSE
 )
-write_csv(emb_base, "embedding_base_b1b2.csv")
+write_csv(pc_scores_base, "pc_scores_base_b1b2.csv")
 
-emb_residual <- data.frame(
+pc_scores_residual <- data.frame(
   participant_id = ids_base,
   Bprime,
   cluster = as.integer(clF),
   stringsAsFactors = FALSE
 )
-write_csv(emb_residual, "embedding_residual_Bprime.csv")
+write_csv(pc_scores_residual, "pc_scores_residual_Bprime.csv")
 
 saveRDS(list(
   participant_id = ids_base, 
@@ -1781,7 +2808,7 @@ w_tbl <- data.frame(
   selected = names(w_full) %in% survivors,
   stringsAsFactors = FALSE
 )
-write_csv(w_tbl, "gower_weights_optimised.csv")
+write_csv(w_tbl, "gower_weights_id_guided.csv")
 
 enc_map <- data.frame(
   mm_col = colnames(Xenc),
@@ -1791,21 +2818,91 @@ enc_map <- data.frame(
 )
 write_csv(enc_map, "encoding_map_and_weight_share.csv")
 
+saveRDS(list(
+  seeds = list(
+    rng_kind = RNG_KIND,
+    seed_global = SEED_GLOBAL,
+    seed_pred = SEED_PRED,
+    seed_jitter = SEED_JITTER,
+    seed_boot = SEED_BOOT,
+    bundle_seed = BUNDLE_SEED
+  ),
+  folds = list(
+    target = fold_id,
+    fibre = folds_f
+  ),
+  data_quality = list(
+    constant_profile_n = if (is.null(degenerate_constant_profiles)) 0L else nrow(degenerate_constant_profiles),
+    constant_profile_ids = if (is.null(degenerate_constant_profiles)) character(0) else degenerate_constant_profiles$participant_id,
+    constant_profile_values = if (is.null(degenerate_constant_profiles)) character(0) else degenerate_constant_profiles$constant_value
+  ),
+  decomposition = list(
+    method = BASE_DECOMP_METHOD,
+    m_star = m_star,
+    k_eff = k_eff
+  ),
+  gower = list(
+    mode = WEIGHTING_MODE,
+    reps = reps,
+    core_idx_rep = core_idx_rep,
+    idx_used = wopt$idx_used,
+    history = wopt$history,
+    final_id = wopt$final_ID,
+    survivors = survivors,
+    multi_run_enabled = isTRUE(GOWER_MULTI_ENABLE && GOWER_MULTI_RUNS > 1L),
+    multi_run_runs = if (!is.null(wopt_list)) length(wopt_list) else 1L
+  )
+), file = "qc_manifest.rds")
+
 # Session Info
 zz <- file("sessionInfo.txt", open = "wt")
 sink(zz)
-on.exit(
-  {
-    sink()
-    close(zz)
-  },
-  add = TRUE
-)
 print(sessionInfo())
 cat("\n\nConfig snapshot:\n")
-print(str(cfg, max.level = 1))
+print(str(list(
+  outputs_dir = OUTPUTS_DIR,
+  weighting_mode = WEIGHTING_MODE,
+  base_decomp_method = BASE_DECOMP_METHOD,
+  rng = list(
+    kind = RNG_KIND,
+    seed_global = SEED_GLOBAL,
+    seed_pred = SEED_PRED,
+    seed_jitter = SEED_JITTER,
+    seed_boot = SEED_BOOT
+  ),
+  compute = list(
+    bam_threads = BAM_THREADS,
+    omp_threads = OMP_THREADS,
+    blas_threads = BLAS_THREADS,
+    ncores_par = NCORES_PAR
+  ),
+  palette = list(
+    engine = PALETTE_ENGINE,
+    name = PALETTE_NAME,
+    name_div = PALETTE_NAME_DIV,
+    direction = PALETTE_DIRECTION
+  ),
+  toggles = list(
+    do_plots = DO_PLOTS,
+    do_diagnostics = DO_DIAGNOSTICS,
+    do_surface = DO_SURFACE,
+    do_sweep = DO_SWEEP
+  ),
+  pc_score_map = list(
+    knn_k = KNN_K,
+    knn_variant = KNN_VARIANT,
+    local_scale = LOCAL_SCALE,
+    multiplicity_weight = MULT_WEIGHT,
+    m_star_fixed = M_STAR_FIXED,
+    id_k_range = K_ID_LO_HI,
+    pc_max = PC_MAX,
+    m_default = M_DEFAULT
+  )
+), max.level = 1))
+sink()
+close(zz)
 
-cat("[export] wrote embeddings, enrichment tables, weights, and session info.\n")
+cat("[export] wrote score tables, enrichment tables, weights, and session info.\n")
 
 # Check alignment
 cat("[Orientation] Base head:\n")
@@ -1817,10 +2914,20 @@ print(head(Base_A))
 # Base-space Plots
 # ------------------------------------------------------------------------------
 
+density_circle_outline <- function(radius = 1, n = 361) {
+  th <- seq(0, 2 * pi, length.out = n)
+  data.frame(u1 = radius * cos(th), u2 = radius * sin(th))
+}
+
 density_plots <- function(geom) {
   stopifnot(all(c("U") %in% names(geom)))
   U_df <- geom$U
-  if ("insq" %in% names(U_df)) U_df <- subset(U_df, insq)
+  U_df <- U_df[is.finite(U_df$u1) & is.finite(U_df$u2), , drop = FALSE]
+  if (!nrow(U_df)) return(NULL)
+  
+  r <- sqrt(U_df$u1^2 + U_df$u2^2)
+  lim <- max(1.05, as.numeric(stats::quantile(r, probs = 0.995, na.rm = TRUE)))
+  lim <- 1.05 * lim
   
   ggplot() +
     stat_density_2d(
@@ -1828,29 +2935,70 @@ density_plots <- function(geom) {
       aes(u1, u2, colour = after_stat(level)),
       bins = 6, linewidth = 0.45, alpha = 0.9
     ) +
-    { scico::scale_colour_scico(palette = cfg$palette$name, direction = 1) } +
+    { scico::scale_colour_scico(palette = PALETTE_NAME, direction = 1) } +
     geom_point(
       data = U_df, aes(u1, u2),
       shape = 16, size = 0.9, colour = scales::alpha("black", 0.35)
     ) +
-    annotate("rect", xmin = -1, xmax = 1, ymin = -1, ymax = 1,
-             fill = NA, colour = "black", linewidth = 0.35) +
-    coord_equal(xlim = c(-1, 1), ylim = c(-1, 1), expand = FALSE) +
-    labs(x = "u1 (whitened b1,b2)", y = "u2") +
+    geom_path(
+      data = density_circle_outline(),
+      aes(u1, u2),
+      inherit.aes = FALSE,
+      colour = "black",
+      linewidth = 0.35
+    ) +
+    coord_equal(xlim = c(-lim, lim), ylim = c(-lim, lim), expand = FALSE) +
+    labs(x = "u1 (whitened/scaled b1,b2)", y = "u2") +
+    theme_pub(12)
+}
+
+density_plots_base <- function(Base_A, pad_frac = 0.06) {
+  dfB <- data.frame(
+    b1 = as.numeric(Base_A[, 1]),
+    b2 = as.numeric(Base_A[, 2]),
+    stringsAsFactors = FALSE
+  )
+  dfB <- dfB[is.finite(dfB$b1) & is.finite(dfB$b2), , drop = FALSE]
+  if (!nrow(dfB)) return(NULL)
+  
+  rx <- range(dfB$b1, na.rm = TRUE)
+  ry <- range(dfB$b2, na.rm = TRUE)
+  wx <- diff(rx)
+  wy <- diff(ry)
+  if (!is.finite(wx) || wx <= 0) wx <- 1
+  if (!is.finite(wy) || wy <= 0) wy <- 1
+  
+  xlim <- c(rx[1] - pad_frac * wx, rx[2] + pad_frac * wx)
+  ylim <- c(ry[1] - pad_frac * wy, ry[2] + pad_frac * wy)
+  
+  ggplot() +
+    stat_density_2d(
+      data = dfB,
+      aes(b1, b2, colour = after_stat(level)),
+      bins = 6, linewidth = 0.45, alpha = 0.9
+    ) +
+    { scico::scale_colour_scico(palette = PALETTE_NAME, direction = 1) } +
+    geom_point(
+      data = dfB, aes(b1, b2),
+      shape = 16, size = 0.9, colour = scales::alpha("black", 0.35)
+    ) +
+    coord_equal(xlim = xlim, ylim = ylim, expand = FALSE) +
+    labs(x = "b1", y = "b2") +
     theme_pub(12)
 }
 
 direction_wheel_plot <- function(geom) {
-  U_sq <- subset(geom$U, insq)
-  if (!nrow(U_sq)) return(NULL)
+  U_disk <- subset(geom$U, rin)
+  U_disk <- U_disk[is.finite(U_disk$u1) & is.finite(U_disk$u2), , drop = FALSE]
+  if (!nrow(U_disk)) return(NULL)
   
   nu <- 500
   pad <- 0.75
   gx <- seq(-1 - pad, 1 + pad, length.out = nu)
   gy <- seq(-1 - pad, 1 + pad, length.out = nu)
   
-  kd <- with(U_sq, MASS::kde2d(u1, u2, n = nu,
-                               lims = c(-1 - pad, 1 + pad, -1 - pad, 1 + pad)))
+  kd <- with(U_disk, MASS::kde2d(u1, u2, n = nu,
+                                 lims = c(-1 - pad, 1 + pad, -1 - pad, 1 + pad)))
   D <- kd$z
   D <- log1p(D / max(D, na.rm = TRUE))
   D <- D / quantile(D, 0.99, na.rm = TRUE)
@@ -1869,15 +3017,14 @@ direction_wheel_plot <- function(geom) {
   G$fill <- grDevices::hcl(H, C, L)
   G$alpha <- as.vector(ALPHA)
   
-  feather1d <- function(x, lo = -1, hi = 1, w = 0.08) {
-    tL <- pmin(pmax((x - lo) / w, 0), 1)
-    tR <- pmin(pmax((hi - x) / w, 0), 1)
-    fL <- (cos(tL * pi / 2))^2
-    fR <- (cos(tR * pi / 2))^2
-    pmin(fL, fR)
+  feather_disk <- function(r, radius = 1, w = 0.08) {
+    a <- rep(0, length(r))
+    a[r <= (radius - w)] <- 1
+    edge <- r > (radius - w) & r <= radius
+    a[edge] <- (cos(((r[edge] - (radius - w)) / w) * pi / 2))^2
+    a
   }
-  Fx <- feather1d(G$u1); Fy <- feather1d(G$u2)
-  G$alpha <- G$alpha * Fx * Fy
+  G$alpha <- G$alpha * feather_disk(r)
   
   anchor <- data.frame(
     x = c(0.85, -0.85, 0.02, 0.02),
@@ -1889,13 +3036,96 @@ direction_wheel_plot <- function(geom) {
   ggplot() +
     geom_raster(data = G, aes(u1, u2, fill = I(fill), alpha = alpha), interpolate = TRUE) +
     scale_alpha(range = c(0, 1), guide = "none") +
-    geom_point(data = U_sq, aes(u1, u2),
+    geom_point(data = U_disk, aes(u1, u2),
                shape = 16, size = 0.8, colour = scales::alpha("black", 0.32)) +
+    geom_path(
+      data = density_circle_outline(),
+      aes(u1, u2),
+      inherit.aes = FALSE,
+      colour = "black",
+      linewidth = 0.35
+    ) +
     coord_equal(xlim = c(-1.5, 1.5), ylim = c(-1.5, 1.5),
                 expand = FALSE, clip = "on") +
     geom_point(data = anchor, aes(x, y), shape = 15, size = 3, colour = anchor$col) +
     geom_text(data = anchor, aes(x, y, label = lab), nudge_x = 0.07, size = 3.2) +
-    labs(x = "u1 (whitened b1,b2)", y = "u2") +
+    labs(x = "u1 (whitened/scaled b1,b2)", y = "u2") +
+    theme_pub(12)
+}
+
+direction_wheel_plot_base <- function(Base_A, cover = 1, pad_frac = 0.06) {
+  dfB <- data.frame(
+    b1 = as.numeric(Base_A[, 1]),
+    b2 = as.numeric(Base_A[, 2]),
+    stringsAsFactors = FALSE
+  )
+  dfB <- dfB[is.finite(dfB$b1) & is.finite(dfB$b2), , drop = FALSE]
+  if (!nrow(dfB)) return(NULL)
+  
+  Xstd <- standardise_to_circle(Base_A, cover = cover)
+  mu <- Xstd$mu
+  S_hi <- Xstd$S_half_inv
+  s <- Xstd$s
+  
+  nu <- 500
+  
+  rx <- range(dfB$b1, na.rm = TRUE)
+  ry <- range(dfB$b2, na.rm = TRUE)
+  wx <- diff(rx)
+  wy <- diff(ry)
+  if (!is.finite(wx) || wx <= 0) wx <- 1
+  if (!is.finite(wy) || wy <= 0) wy <- 1
+  
+  lims <- c(
+    rx[1] - pad_frac * wx, rx[2] + pad_frac * wx,
+    ry[1] - pad_frac * wy, ry[2] + pad_frac * wy
+  )
+  
+  kd <- with(dfB, MASS::kde2d(b1, b2, n = nu, lims = lims))
+  D <- kd$z
+  D <- log1p(D / max(D, na.rm = TRUE))
+  D <- D / stats::quantile(D, 0.99, na.rm = TRUE)
+  D[D > 1] <- 1
+  D[D < 0] <- 0
+  ALPHA <- D^0.70
+  
+  gx <- kd$x
+  gy <- kd$y
+  G <- expand.grid(b1 = gx, b2 = gy)
+  
+  Uq <- (sweep(as.matrix(G), 2, mu, "-") %*% t(S_hi)) / s
+  theta <- atan2(Uq[, 2], Uq[, 1])
+  r <- sqrt(Uq[, 1]^2 + Uq[, 2]^2)
+  
+  H0 <- 170
+  L0 <- 60
+  Cmax <- 110
+  betaC <- 0.90
+  H <- (H0 + theta * 180 / pi) %% 360
+  C <- pmin(Cmax * (pmin(r, 1)^betaC), Cmax)
+  L <- pmax(0, pmin(100, L0 - 6 * (pmin(r, 1)^1.1)))
+  
+  G$fill <- grDevices::hcl(H, C, L)
+  G$alpha <- as.vector(ALPHA)
+  
+  ggplot() +
+    geom_raster(
+      data = G,
+      aes(b1, b2, fill = I(fill), alpha = alpha),
+      interpolate = TRUE
+    ) +
+    scale_alpha(range = c(0, 1), guide = "none") +
+    geom_point(
+      data = dfB,
+      aes(b1, b2),
+      shape = 16, size = 0.8,
+      colour = scales::alpha("black", 0.32)
+    ) +
+    coord_equal(
+      xlim = lims[1:2], ylim = lims[3:4],
+      expand = FALSE, clip = "on"
+    ) +
+    labs(x = "b1", y = "b2") +
     theme_pub(12)
 }
 
@@ -1903,10 +3133,20 @@ direction_wheel_plot <- function(geom) {
 p_dens <- density_plots(geom)
 save_plot_gg("FIG_dens_unitsquare_scatter", p_dens, width = 8.0, height = 7.0)
 
+p_dens_base <- density_plots_base(Base_A)
+if (!is.null(p_dens_base)) {
+  save_plot_gg("FIG_dens_base_scatter", p_dens_base, width = 8.0, height = 7.0)
+}
+
 # Direction plot
 p_dir <- direction_wheel_plot(geom)
 if (!is.null(p_dir)) {
   save_plot_gg("FIG_uv_direction_density_HCL_smooth", p_dir, width = 8.0, height = 7.0)
+}
+
+p_dir_base <- direction_wheel_plot_base(Base_A)
+if (!is.null(p_dir_base)) {
+  save_plot_gg("FIG_uv_direction_density_HCL_smooth_BASE", p_dir_base, width = 8.0, height = 7.0)
 }
 
 # ------------------------------------------------------------------------------
@@ -2061,11 +3301,31 @@ plot_biplots <- function(Rtab, Base_A, U) {
 # Biplots
 if (!is.null(varmap)) {
   Rtab <- build_biplot_data(Z_A, varmap, Base_A, geom$U)
-  write_csv(Rtab, file.path(OUTPUTS_DIR, "items_vs_base_and_unitdisk_correlations.csv"))
+  write_csv(Rtab, "items_vs_base_and_unitdisk_correlations.csv")
   
   BIP <- plot_biplots(Rtab, Base_A, geom$U)
   save_plot_gg("FIG_biplot_items_BASE", BIP$p_base, width = 8.0, height = 7.0)
   save_plot_gg("FIG_biplot_items_UNITDISK", BIP$p_disk, width = 8.0, height = 7.0)
+  item_component_correlations_base <- as.matrix(Rtab[, c("r_b1", "r_b2")])
+  rownames(item_component_correlations_base) <- Rtab$item
+  colnames(item_component_correlations_base) <- c("u1", "u2")
 } else {
   msgf("[biplot] varmap missing; skipping biplots.")
+  item_component_correlations_base <- matrix(numeric(0), nrow = 0L, ncol = 2L)
+  colnames(item_component_correlations_base) <- c("u1", "u2")
 }
+
+pc_scores_2d <- as.matrix(Base_A)
+colnames(pc_scores_2d) <- c("u1", "u2")
+
+saveRDS(list(
+  participant_id = ids_base,
+  pc_scores_2d = pc_scores_2d,
+  spectrum = base_spectrum,
+  explained_variance_ratio = base_explained_variance_ratio,
+  selected_items = survivors,
+  weights = w_full,
+  item_component_correlations = item_component_correlations_base,
+  weighting_mode = WEIGHTING_MODE,
+  decomp_method = BASE_DECOMP_METHOD
+), file = "method_sensitivity_fit_bundle.rds")
