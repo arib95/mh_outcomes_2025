@@ -1,13 +1,14 @@
 # sweep_dimension_contplot.R
 # Runs dimension_contplot.R across every CSV in the data/ folder that
-# setup.R already references via cfg$io$inputs$behaviour_csv.
+# setup.R already references via the default `behaviour_csv`.
 
 # --------- config toggles (optional) ----------
 SKIP_IF_METRICS_EXIST <- FALSE   # set TRUE to skip if metrics already present
 STOP_ON_ERROR         <- TRUE   # set TRUE to halt on firsailure
 
 # --------- bootstrap project context ----------
-source("0_setup.R", chdir = TRUE)  # brings cfg, OUTPUTS_DIR, helpers, etc.
+SETUP_CFG <- list()
+source("0_setup.R", chdir = TRUE)  # brings OUTPUTS_DIR, helpers, defaults, etc.
 
 # Where to sweep: derive the data directory from the configured behaviour_csv
 data_dir <- dirname(behaviour_csv)
@@ -28,7 +29,10 @@ message(sprintf("Sweeping %d CSV files under: %s", length(csv_files), normalizeP
 
 # Quick header reader
 .header_cols <- function(f) {
-  tryCatch(names(data.table::fread(f, nrows = 0L, showProgress = FALSE)), error = function(e) character(0))
+  tryCatch(
+    names(data.table::fread(f, sep = ";", dec = ",", nrows = 0L, showProgress = FALSE)),
+    error = function(e) character(0)
+  )
 }
 
 # --------- main sweep ----------

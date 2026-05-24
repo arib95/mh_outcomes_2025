@@ -9,7 +9,7 @@ if (!file.exists(full_csv_path)) {
   stop(paste("Could not find:", full_csv_path))
 }
 
-MET <- data.table::fread(full_csv_path)
+MET <- data.table::fread(full_csv_path, sep = ";", dec = ",")
 
 dt <- MET[var %like% "SCID|NODIAG"]
 
@@ -20,7 +20,7 @@ dt <- MET[var %like% "SCID|NODIAG"]
 diag_path <- "data/wide_diagnoses.csv"
 
 if (file.exists(diag_path)) {
-  raw_df <- data.table::fread(diag_path)
+  raw_df <- data.table::fread(diag_path, sep = ";", dec = ",")
   
   get_cases <- function(v) {
     if (v == "NODIAG") {
@@ -41,7 +41,7 @@ if (file.exists(diag_path)) {
 # 3. Derivations and display fields
 # ==================================================
 
-# Added value of residuals
+# AUC gain from adding residual terms to the map-only model.
 dt[, delta_auc := auc_stacked - oof_point]
 
 # Display label
@@ -58,7 +58,7 @@ dt[, sig_cat := fcase(
   p_delta_stacked < 0.05,  "*",
   default = ""
 )]
-dt[, color_grp := fifelse(p_delta_stacked < 0.05 & delta_auc > 0, "Sig", "Ns")]
+dt[, color_grp := fifelse(p_delta_stacked < 0.05 & delta_auc > 0, "Improved", "Other")]
 
 # Text columns for the left “table” panel
 fmt_ci <- function(pt, lo, hi) sprintf("%.3f\n(%.3f–%.3f)", pt, lo, hi)
@@ -90,7 +90,7 @@ p_table <- ggplot(dt, aes(y = label)) +
     expand = c(0, 0),
     position = "top",
     breaks = c(0, 2.2, 3.2, 4.5, 5.8),
-    labels = c("Diagnosis", "Cases", "Base AUC\n(95% CI)", "Full AUC\n(Base+Resid)", "p")
+    labels = c("Diagnosis", "Cases", "Map AUC\n(95% CI)", "Map+residual\nAUC", "p")
   ) +
   theme_void() +
   theme(
@@ -107,12 +107,12 @@ p_forest <- ggplot(dt, aes(x = delta_auc, y = label, color = color_grp)) +
   geom_segment(aes(x = 0, xend = delta_auc, y = label, yend = label), linewidth = 0.8) +
   geom_point(size = 3) +
   geom_text(aes(label = sig_cat), vjust = -0.5, size = 3.5, show.legend = FALSE) +
-  scale_color_manual(values = c("Sig" = "#2E86C1", "Ns" = "grey70")) +
+  scale_color_manual(values = c("Improved" = "#2E86C1", "Other" = "grey70")) +
   scale_x_continuous(
     labels = function(x) sprintf("+%.2f", x),
     expand = expansion(mult = c(0, 0.1))
   ) +
-  labs(x = "Δ AU-ROC (Added Value of Residuals)", color = NULL) +
+  labs(x = "AU-ROC gain from residual terms", color = NULL) +
   theme_classic() +
   theme(
     axis.line.y = element_blank(),

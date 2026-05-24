@@ -1,15 +1,23 @@
-# scripts/surprisal_vs_scz_logit.R
-# Fits: SCID schizophrenia membership ~ surprisal
+# scripts/surprisal_schz.R
+# Fits a binary diagnosis indicator to surprisal.
 # Inputs:
 #   - data/acquiescence.csv (participant_id, surprise)
-#   - data/wide_diagnoses.csv (participant_id, SCID.DIAG.Schizophrenia)
+#   - data/wide_diagnoses.csv (participant_id, target diagnosis column)
 # Outputs:
-#   - out/surprisal_scz_logit_curve.csv (prediction grid with 95% CI)
-#   - out/surprisal_scz_logit.png (optional plot)
+#   - out/surprisal_<target>_logit_curve.csv (prediction grid with 95% CI)
+#   - out/surprisal_<target>_logit.png (optional plot)
 
 suppressPackageStartupMessages({
   library(data.table)
 })
+
+target_dx <- Sys.getenv("TARGET_DX", unset = "SCID.DIAG.Schizophrenia")
+target_label <- Sys.getenv("TARGET_LABEL", unset = sub("^SCID\\.DIAG\\.", "", target_dx))
+target_slug <- Sys.getenv(
+  "TARGET_SLUG",
+  unset = tolower(gsub("[^A-Za-z0-9]+", "_", target_label))
+)
+target_slug <- gsub("^_|_$", "", target_slug)
 
 # ==================================================
 # Helpers
@@ -38,6 +46,8 @@ char_to_num <- function(v) {
 
 aq <- fread(
   "data/acquiescence.csv",
+  sep = ";",
+  dec = ",",
   na.strings = c("", "NA", "N/A", "NaN", "nan", "null", "NULL", ".", "-"),
   strip.white = TRUE
 )
@@ -47,16 +57,18 @@ aq[, participant_id := as.character(participant_id)]
 
 dx <- fread(
   "data/wide_diagnoses.csv",
+  sep = ";",
+  dec = ",",
   na.strings = c("", "NA", "N/A", "NaN", "nan", "null", "NULL", ".", "-"),
   strip.white = TRUE
 )
 dx <- as.data.table(lapply(dx, char_to_num))
-stopifnot("participant_id" %in% names(dx), "SCID.DIAG.BipolarI" %in% names(dx))
+stopifnot("participant_id" %in% names(dx), target_dx %in% names(dx))
 dx[, participant_id := as.character(participant_id)]
 
 D <- merge(
   aq[, .(participant_id, surprise = as.numeric(surprise))],
-  dx[, .(participant_id, SCID.DIAG.BipolarI)],
+  dx[, c("participant_id", target_dx), with = FALSE],
   by = "participant_id",
   all = FALSE
 )
@@ -65,7 +77,7 @@ D <- merge(
 # Outcome construction and QC
 # ==================================================
 
-raw_dx <- D[["SCID.DIAG.BipolarI"]]
+raw_dx <- D[[target_dx]]
 
 D[, y := {
   if (is.numeric(raw_dx)) {
@@ -116,7 +128,9 @@ curve_dt <- data.table(
 # ==================================================
 
 dir.create("out", showWarnings = FALSE, recursive = TRUE)
-fwrite(curve_dt, "out/surprisal_scz_logit_curve.csv")
+curve_path <- file.path("out", sprintf("surprisal_%s_logit_curve.csv", target_slug))
+plot_path <- file.path("out", sprintf("surprisal_%s_logit.png", target_slug))
+fwrite(curve_dt, curve_path, sep = ";", dec = ",")
 
 # Optional plot
 if (requireNamespace("ggplot2", quietly = TRUE)) {
@@ -140,12 +154,12 @@ if (requireNamespace("ggplot2", quietly = TRUE)) {
       aes(x = surprise, y = p),
       linewidth = 1
     ) +
-    scale_y_continuous("Schizophrenia membership (probability)", limits = c(0, 1)) +
+    scale_y_continuous(sprintf("%s membership probability", target_label), limits = c(0, 1)) +
     scale_x_continuous("Surprisal") +
-    labs(title = "Logit curve: surprisal → schizophrenia membership") +
+    labs(title = sprintf("%s membership by surprisal", target_label)) +
     theme_minimal(base_size = 12)
   
-  ggsave("out/surprisal_scz_logit.png", p, width = 7, height = 4.6, dpi = 200)
+  ggsave(plot_path, p, width = 7, height = 4.6, dpi = 200)
 }
 
 # ==================================================
@@ -157,6 +171,6 @@ OR <- exp(unname(s["Estimate"]))
 CI <- tryCatch(exp(confint(fit, "surprise")), error = function(e) c(NA, NA))
 
 cat(sprintf(
-  "Logit(y ~ surprisal): OR per +1 unit = %.3f (95%% CI %.3f–%.3f), p=%.3g; n=%d\n",
-  OR, CI[1], CI[2], unname(s["Pr(>|z|)"]), nrow(D)
+  "Logit(%s ~ surprisal): OR per +1 unit = %.3f (95%% CI %.3f-%.3f), p=%.3g; n=%d\n",
+  target_dx, OR, CI[1], CI[2], unname(s["Pr(>|z|)"]), nrow(D)
 ))

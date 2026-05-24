@@ -2,7 +2,7 @@
 # Behavioural mapping with GAMs.
 #
 # Dependencies:
-#   Expects 'setup.R' to be sourced previously (provides cfg, palette helpers, IO wrappers, futures).
+#   Expects 'setup.R' to be sourced previously (provides palette vars, IO wrappers, futures).
 #   Expects input data frames: Base_A (n x 2), fold_id (optional), and geometry object 'geom'.
 
 options(future.debug = FALSE)
@@ -45,9 +45,9 @@ msgf <- function(...) message(sprintf(...))
 
 # Adaptive colour scales supporting scico, paletteer, and manual definitions from global config.
 scale_prob_colour <- function(limits = NULL, name = NULL) {
-  eng <- tolower(cfg$palette$engine %||% "scico")
-  dir <- cfg$palette$direction %||% 1
-  pal <- cfg$palette$name %||% "lipari"
+  eng <- tolower(PALETTE_ENGINE %||% "scico")
+  dir <- PALETTE_DIRECTION %||% 1
+  pal <- PALETTE_NAME %||% "lipari"
 
   if (eng == "scico" && requireNamespace("scico", quietly = TRUE)) {
     ggplot2::scale_colour_gradientn(
@@ -61,9 +61,9 @@ scale_prob_colour <- function(limits = NULL, name = NULL) {
       colours = cols, limits = limits, oob = scales::squish, name = name,
       na.value = "transparent"
     )
-  } else if (eng == "manual" && !is.null(cfg$palette$colours)) {
+  } else if (eng == "manual" && !is.null(PALETTE_COLOURS)) {
     ggplot2::scale_colour_gradientn(
-      colours = cfg$palette$colours, limits = limits, name = name,
+      colours = PALETTE_COLOURS, limits = limits, name = name,
       na.value = "transparent"
     )
   } else {
@@ -75,9 +75,9 @@ scale_prob_colour <- function(limits = NULL, name = NULL) {
 }
 
 scale_prob_fill <- function(limits = NULL, name = NULL) {
-  eng <- tolower(cfg$palette$engine %||% "scico")
-  dir <- cfg$palette$direction %||% 1
-  pal <- cfg$palette$name %||% "lipari"
+  eng <- tolower(PALETTE_ENGINE %||% "scico")
+  dir <- PALETTE_DIRECTION %||% 1
+  pal <- PALETTE_NAME %||% "lipari"
 
   if (eng == "scico" && requireNamespace("scico", quietly = TRUE)) {
     ggplot2::scale_fill_gradientn(
@@ -91,9 +91,9 @@ scale_prob_fill <- function(limits = NULL, name = NULL) {
       colours = cols, limits = limits, oob = scales::squish, name = name,
       na.value = "transparent"
     )
-  } else if (eng == "manual" && !is.null(cfg$palette$colours)) {
+  } else if (eng == "manual" && !is.null(PALETTE_COLOURS)) {
     ggplot2::scale_fill_gradientn(
-      colours = cfg$palette$colours, limits = limits, name = name,
+      colours = PALETTE_COLOURS, limits = limits, name = name,
       na.value = "transparent"
     )
   } else {
@@ -136,6 +136,8 @@ base_dt <- data.table::data.table(
 
 DT <- data.table::fread(
   behaviour_csv,
+  sep = ";",
+  dec = ",",
   na.strings = c("", "NA", "N/A", "NaN", "nan", "null", "NULL", ".", "-"),
   strip.white = TRUE
 )
@@ -245,7 +247,10 @@ get_model_overrides <- function(
   make_default_entry <- function() list(choice = "auto", trials = NA_integer_, trials_var = NA_character_)
 
   if (file.exists(save_path)) {
-    ov_raw <- tryCatch(data.table::fread(save_path, colClasses = "character"), error = function(e) NULL)
+    ov_raw <- tryCatch(
+      data.table::fread(save_path, sep = ";", dec = ",", colClasses = "character"),
+      error = function(e) NULL
+    )
     if (!is.null(ov_raw) && all(c("var", "choice") %in% names(ov_raw))) {
       if (!"trials" %in% names(ov_raw)) ov_raw[, trials := NA_character_]
       if (!"trials_var" %in% names(ov_raw)) ov_raw[, trials_var := NA_character_]
@@ -379,7 +384,9 @@ get_model_overrides <- function(
         if (is.null(tv) || is.na(tv) || !nzchar(tv)) NA_character_ else tv
       }, character(1))
     ),
-    save_path
+    save_path,
+    sep = ";",
+    dec = ","
   )
   message("Saved overrides to: ", normalizePath(save_path, mustWork = FALSE))
   out
@@ -1928,7 +1935,7 @@ analyse_model_kernel <- function(d, yi, v_name, geom, Uobs, XR, is_two_col, K) {
     )
     
     if (!is.na(p_boot) && p_boot <= 0.01) {
-      message(sprintf("High significance detected for %s (p=%.3f). Extending B to 1000...\n", v, p_boot))
+      message(sprintf("Small bootstrap p-value for %s (p=%.3f). Extending B to 1000...\n", v, p_boot))
       
       p_boot_high <- lrt_boot_gam(
         fit_null = fit_add_ml,
@@ -2659,7 +2666,7 @@ plot_worker <- function(job, OUT_SUBDIR, MET_dt = NULL, OOF_PERM_B = 200) {
       }
       pc <- pc + geom_point(shape = 16, size = 1.8, alpha = 0.7) +
         coord_equal(xlim = c(0, 1), ylim = c(0, 1), expand = FALSE) +
-        labs(x = "Predicted probability", y = "Observed event rate", title = paste("Calibration —", nm), subtitle = cal_txt, caption = cap_txt) +
+        labs(x = "Predicted probability", y = "Observed event rate", title = paste("Calibration:", nm), subtitle = cal_txt, caption = cap_txt) +
         theme_pub(11) + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), legend.position = "none")
       save_plot_gg(file.path(OUT_SUBDIR, paste0("calibration_", nm)), pc, width = 5.5, height = 5)
     }

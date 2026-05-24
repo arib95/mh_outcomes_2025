@@ -68,7 +68,7 @@ export_dx_metrics <- function(M, out_dir = OUTPUTS_DIR) {
   # Case 1: already in expected long AUC schema
   # --------------------------------------------------------------------------
   if (all(c("dx", "model", "AUC", "lo", "hi") %in% names(M))) {
-    readr::write_csv(M, file.path(out_dir, "AUC_bootstrap_CI.csv"))
+    write_csv(M, file.path(out_dir, "AUC_bootstrap_CI.csv"))
     msgf("[dx-metrics] Wrote AUC_bootstrap_CI.csv (dx/model/AUC/lo/hi).")
     return(invisible(TRUE))
   }
@@ -100,7 +100,7 @@ export_dx_metrics <- function(M, out_dir = OUTPUTS_DIR) {
       )
     
     if (nrow(A)) {
-      readr::write_csv(A, file.path(out_dir, "AUC_bootstrap_CI.csv"))
+      write_csv(A, file.path(out_dir, "AUC_bootstrap_CI.csv"))
       msgf("[dx-metrics] Wrote AUC_bootstrap_CI.csv from contplot oof_* fields.")
     } else {
       msgf("[dx-metrics] No AUC rows found in contplot metrics.")
@@ -112,7 +112,7 @@ export_dx_metrics <- function(M, out_dir = OUTPUTS_DIR) {
       dplyr::transmute(dx, model, AUPRC = oof_point, lo = oof_lo, hi = oof_hi)
     
     if (nrow(PRC)) {
-      readr::write_csv(PRC, file.path(out_dir, "AUPRC_bootstrap_CI.csv"))
+      write_csv(PRC, file.path(out_dir, "AUPRC_bootstrap_CI.csv"))
       msgf("[dx-metrics] Wrote AUPRC_bootstrap_CI.csv from contplot metrics.")
     }
     
@@ -121,7 +121,7 @@ export_dx_metrics <- function(M, out_dir = OUTPUTS_DIR) {
       dplyr::transmute(dx, model, AUPRG = oof_point, lo = oof_lo, hi = oof_hi)
     
     if (nrow(PRG)) {
-      readr::write_csv(PRG, file.path(out_dir, "AUPRG_bootstrap_CI.csv"))
+      write_csv(PRG, file.path(out_dir, "AUPRG_bootstrap_CI.csv"))
       msgf("[dx-metrics] Wrote AUPRG_bootstrap_CI.csv from contplot metrics.")
     }
     
@@ -280,7 +280,7 @@ plot_cluster_dx_heatmap <- function(V, cap = 2) {
     geom_tile() +
     scale_shared_div(name = "log2(lift)", limits = c(-cap, cap)) +
     scale_y_discrete(labels = labs_wrapped) +
-    labs(x = "cluster", y = NULL, title = "Diagnosis archetypes per soft cluster") +
+    labs(x = "Cluster", y = NULL, title = "Diagnosis enrichment by soft cluster") +
     theme_pub(15) +
     theme(
       panel.grid = element_blank(),
@@ -301,8 +301,7 @@ plots_for_clusters <- function(CL_LIST, geom) {
         aes(z = p, label = after_stat(sprintf("%.0f%%", ..level..*100))),
         colour = "white", linewidth = 0.2, breaks = c(0.25, 0.50, 0.75, 0.90)
       ) +
-      # Use Prob Scale (0-1)
-      scale_prob_fill(limits = c(0, 1), name = "Prob") +
+      scale_prob_fill(limits = c(0, 1), name = "Probability") +
       coord_equal(xlim = xlim, ylim = ylim, expand = FALSE) +
       labs(
         title = paste("Cluster", obj$key), 
@@ -312,7 +311,7 @@ plots_for_clusters <- function(CL_LIST, geom) {
       theme(
         axis.title = element_blank(),
         plot.subtitle = element_text(size = 8, lineheight = 1.1, colour = "grey30"),
-        legend.position = "none" # Hide legends for grid view to save space
+        legend.position = "none"
       )
   }
   
@@ -335,7 +334,7 @@ plots_for_clusters <- function(CL_LIST, geom) {
   # Combine into grids (using patchwork if available, else gridExtra)
   compose <- function(plist) {
     if (requireNamespace("patchwork", quietly = TRUE)) {
-      patchwork::wrap_plots(plist, ncol = 3) # Adjust ncol as needed
+      patchwork::wrap_plots(plist, ncol = 3)
     } else {
       do.call(gridExtra::grid.arrange, c(plist, ncol = 3))
     }

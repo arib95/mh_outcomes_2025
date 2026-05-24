@@ -4,7 +4,7 @@ library(flextable)
 library(tibble)
 library(officer)
 
-# cfg <- list(
+# demo_config <- list(
 #   cohort = "LA5c",
 #   demo_path = "data/demo.csv",
 #   dx_path = "data/wide_diagnoses.csv",
@@ -21,7 +21,7 @@ library(officer)
 #   group_source = "id"
 # )
 
-cfg <- list(
+demo_config <- list(
   cohort = "TCP",
   demo_path = "data/demo.csv",
   dx_path = "data/wide_diagnoses.csv",
@@ -87,17 +87,17 @@ fmt_npct <- function(x, digits = 0) {
 }
 
 read_delim_clean <- function(path, id_col) {
-  read_delim(path, delim = ";", show_col_types = FALSE) %>%
+  read_csv2(path, show_col_types = FALSE) %>%
     mutate("{id_col}" := clean_id(.data[[id_col]]))
 }
 
-derive_clinical_status <- function(data, cfg) {
-  if (cfg$cohort == "TCP") {
-    if (!cfg$ndiagnoses_col %in% names(data)) {
-      stop("Missing TCP diagnoses-count column: ", cfg$ndiagnoses_col)
+derive_clinical_status <- function(data, demo_config) {
+  if (demo_config$cohort == "TCP") {
+    if (!demo_config$ndiagnoses_col %in% names(data)) {
+      stop("Missing TCP diagnoses-count column: ", demo_config$ndiagnoses_col)
     }
     
-    ndiag <- suppressWarnings(as.numeric(data[[cfg$ndiagnoses_col]]))
+    ndiag <- suppressWarnings(as.numeric(data[[demo_config$ndiagnoses_col]]))
     
     factor(
       case_when(
@@ -109,14 +109,14 @@ derive_clinical_status <- function(data, cfg) {
       levels = c("No diagnosis", "Any diagnosis")
     )
   } else {
-    if (!cfg$nodiag_col %in% names(data)) {
-      stop("Missing LA5c no-diagnosis column: ", cfg$nodiag_col)
+    if (!demo_config$nodiag_col %in% names(data)) {
+      stop("Missing LA5c no-diagnosis column: ", demo_config$nodiag_col)
     }
     
     factor(
       case_when(
-        normalise_binary(data[[cfg$nodiag_col]]) == 1L ~ "No diagnosis",
-        normalise_binary(data[[cfg$nodiag_col]]) == 0L ~ "Any diagnosis",
+        normalise_binary(data[[demo_config$nodiag_col]]) == 1L ~ "No diagnosis",
+        normalise_binary(data[[demo_config$nodiag_col]]) == 0L ~ "Any diagnosis",
         TRUE ~ NA_character_
       ),
       levels = c("No diagnosis", "Any diagnosis")
@@ -124,25 +124,25 @@ derive_clinical_status <- function(data, cfg) {
   }
 }
 
-demo_raw <- read_delim_clean(cfg$demo_path, cfg$id_col)
-dx_raw   <- read_delim_clean(cfg$dx_path, cfg$id_col)
+demo_raw <- read_delim_clean(demo_config$demo_path, demo_config$id_col)
+dx_raw   <- read_delim_clean(demo_config$dx_path, demo_config$id_col)
 
 u_mat <- as.data.frame(geom$U)
 
 u_ids_from_rownames <- rownames(u_mat)
 u_ids_from_rownames <- if (!is.null(u_ids_from_rownames)) clean_id(u_ids_from_rownames) else character(0)
 
-demo_ids <- clean_id(demo_raw[[cfg$id_col]])
+demo_ids <- clean_id(demo_raw[[demo_config$id_col]])
 overlap_rownames <- sum(u_ids_from_rownames %in% demo_ids)
 
 if (overlap_rownames > 0) {
   u_df <- u_mat %>%
-    rownames_to_column(cfg$id_col) %>%
-    mutate("{cfg$id_col}" := clean_id(.data[[cfg$id_col]]))
+    rownames_to_column(demo_config$id_col) %>%
+    mutate("{demo_config$id_col}" := clean_id(.data[[demo_config$id_col]]))
 } else if (exists("ids_base", inherits = TRUE) && length(ids_base) == nrow(u_mat)) {
   u_df <- u_mat %>%
-    mutate("{cfg$id_col}" := clean_id(ids_base)) %>%
-    relocate(all_of(cfg$id_col))
+    mutate("{demo_config$id_col}" := clean_id(ids_base)) %>%
+    relocate(all_of(demo_config$id_col))
 } else {
   stop(
     "Could not match geometry IDs to demo.csv IDs. ",
@@ -152,23 +152,23 @@ if (overlap_rownames > 0) {
 }
 
 df <- u_df %>%
-  inner_join(demo_raw, by = cfg$id_col) %>%
-  inner_join(dx_raw, by = cfg$id_col) %>%
+  inner_join(demo_raw, by = demo_config$id_col) %>%
+  inner_join(dx_raw, by = demo_config$id_col) %>%
   mutate(
-    age_std = suppressWarnings(as.numeric(.data[[cfg$age_col]])),
+    age_std = suppressWarnings(as.numeric(.data[[demo_config$age_col]])),
     sex_std = factor(
-      standardise_from_map(.data[[cfg$sex_col]], cfg$sex_map),
+      standardise_from_map(.data[[demo_config$sex_col]], demo_config$sex_map),
       levels = c("Male", "Female")
     ),
-    group_std = if (cfg$group_source == "column") {
+    group_std = if (demo_config$group_source == "column") {
       factor(
-        standardise_from_map(.data[[cfg$group_col]], cfg$group_map),
+        standardise_from_map(.data[[demo_config$group_col]], demo_config$group_map),
         levels = c("General population", "Clinical group")
       )
     } else {
-      derive_group_from_id(.data[[cfg$id_col]])
+      derive_group_from_id(.data[[demo_config$id_col]])
     },
-    clinical_status = derive_clinical_status(cur_data(), cfg)
+    clinical_status = derive_clinical_status(cur_data(), demo_config)
   )
 
 if (nrow(df) == 0) {
@@ -247,7 +247,7 @@ table_df <- bind_rows(
 ft <- flextable(table_df[, c("Characteristic", "Value")]) %>%
   set_header_labels(
     Characteristic = "Characteristic",
-    Value = paste0(cfg$cohort, " (n = ", nrow(df), ")")
+    Value = paste0(demo_config$cohort, " (n = ", nrow(df), ")")
   ) %>%
   bold(part = "header", bold = TRUE) %>%
   bold(i = table_df$section, j = 1:2, bold = TRUE, part = "body") %>%
@@ -269,4 +269,4 @@ doc <- read_docx() %>%
   body_add_flextable(ft) %>%
   body_add_par("Note. Values are mean (SD) or n (%).", style = "Normal")
 
-print(doc, target = cfg$output_path)
+print(doc, target = demo_config$output_path)
