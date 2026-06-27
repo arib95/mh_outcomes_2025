@@ -7,7 +7,12 @@
 
 load_dx_wide <- function(path, include_nodiag = FALSE, min_prev = 0, max_prev = 1) {
   # Load raw binary matrix and sanitize column names
-  DX0 <- suppressWarnings(readr::read_csv2(path, show_col_types = FALSE))
+  DX0 <- suppressWarnings(
+    readr::read_csv2(
+      path,
+      show_col_types = FALSE
+    )
+  )
   stopifnot(is.data.frame(DX0), ncol(DX0) >= 2)
   names(DX0) <- trimws(gsub("\ufeff", "", names(DX0)))
   
@@ -671,7 +676,7 @@ null_column_shuffle <- function(DX, KNN_K, KNN_VARIANT, MIN_CLUSTER_SIZE, reps =
   progressr::handlers(global = TRUE)
   progressr::with_progress({
     p <- progressr::progressor(steps = reps)
-    out <- future.apply::future_lapply(seq_len(reps), function(r) {
+    out <- FUTURE_LAPPLY(seq_len(reps), function(r) {
       z <- do_one(r)
       p()
       z
@@ -821,11 +826,14 @@ ari <- bootstrap_ari(Dm, KNN_K, KNN_VARIANT, LOCAL_SCALE, COMMUNITY_ALGO, mult =
 write_csv(data.frame(boot = seq_along(ari), ari = ari), "cluster_bootstrap_ari.csv")
 
 # Null Model: Column-shuffle (prevalence preserving)
-old_plan <- future::plan()
-on.exit(future::plan(old_plan), add = TRUE)
-future::plan(future::multisession, workers = max(1, parallel::detectCores() - 1))
-
-nulls_col <- null_column_shuffle(DX, KNN_K, KNN_VARIANT, MIN_CLUSTER_SIZE, reps = COL_SHUFFLE_REPS, seed = SEED)
+nulls_col <- null_column_shuffle(
+  DX,
+  KNN_K,
+  KNN_VARIANT,
+  MIN_CLUSTER_SIZE,
+  reps = COL_SHUFFLE_REPS,
+  seed = SEED
+)
 Q_p_col <- mean(nulls_col$Q >= Q, na.rm = TRUE)
 S_p_col <- mean(nulls_col$S >= S_obs, na.rm = TRUE)
 ID_p_high <- mean(nulls_col$ID >= ID_twonn_all, na.rm = TRUE)
@@ -1034,58 +1042,54 @@ if (isTRUE(DO_SWEEP)) {
   grid_legacy <- expand.grid(K = K_GRID, variant = VARIANT_GRID, stringsAsFactors = FALSE)
   seed_vec <- SEED + seq_len(nrow(grid_legacy))
   
-  old_plan <- future::plan()
-  on.exit(future::plan(old_plan), add = TRUE)
-  future::plan(future::multisession, workers = NCORES_PAR)
-  
-  sens <- future.apply::future_lapply(seq_len(nrow(grid_legacy)), function(i) {
-    k <- grid_legacy$K[i]
-    v <- grid_legacy$variant[i]
-    gi <- get_membership(D = D_dx, k = k, variant = v, mult = multU, B = N_PERM, deg_reps = DEG_REPS, null_scope = "kept", seed = seed_vec[i], local_scale = LOCAL_SCALE)
-    
-    p_pref <- {
-      Bq <- sum(is.finite(gi$Q_null_deg))
-      if (Bq > 0) (sum(gi$Q_null_deg >= gi$Q, na.rm = TRUE) + 1) / (Bq + 1) else NA_real_
-    }
-    
-    Q_p_two <- {
-      Bw <- sum(is.finite(gi$Q_null_w))
-      if (Bw > 0) {
-        mu <- mean(gi$Q_null_w, na.rm = TRUE)
-        sd <- stats::sd(gi$Q_null_w, na.rm = TRUE)
-        if (is.finite(mu) && is.finite(sd) && sd > 0) 2 * stats::pnorm(-abs((gi$Q - mu) / sd)) else NA_real_
-      } else { NA_real_ }
-    }
-    
-    S <- NA_real_
-    lab_all <- as.integer(gi$m)
-    kk <- gi$kept_idx
-    if (length(kk) > 1L) {
-      lab_k <- as.integer(factor(lab_all[kk]))
-      tabk <- table(lab_k)
-      keep_lab <- as.integer(names(tabk)[tabk >= 2L]) 
-      sel_k <- lab_k %in% keep_lab
-      if (sum(sel_k) >= 2L && length(keep_lab) >= 2L) {
-        Dk <- as.matrix(D_dx)[kk, kk, drop = FALSE]
-        Sil <- try(cluster::silhouette(lab_k[sel_k], as.dist(Dk[sel_k, sel_k, drop = FALSE])), silent = TRUE)
-        if (!inherits(Sil, "try-error")) S <- mean(Sil[, "sil_width"], na.rm = TRUE)
+  sens <- FUTURE_LAPPLY(seq_len(nrow(grid_legacy)), function(i) {
+      k <- grid_legacy$K[i]
+      v <- grid_legacy$variant[i]
+      gi <- get_membership(D = D_dx, k = k, variant = v, mult = multU, B = N_PERM, deg_reps = DEG_REPS, null_scope = "kept", seed = seed_vec[i], local_scale = LOCAL_SCALE)
+      
+      p_pref <- {
+        Bq <- sum(is.finite(gi$Q_null_deg))
+        if (Bq > 0) (sum(gi$Q_null_deg >= gi$Q, na.rm = TRUE) + 1) / (Bq + 1) else NA_real_
       }
-    }
-    
-    S_p <- NA_real_
-    if (is.finite(S)) {
-      ids_all <- as.character(DXu_id$participant_id)
-      cs <- compute_silhouette_with_colshuffle(DX, ids_all, kept_idx = kk[sel_k], labs_kept = lab_k[sel_k], reps = SIL_REPS, seed = seed_vec[i] + 1e5L)
-      S <- cs$S_obs
-      S_p <- cs$S_p
-    }
-    
-    data.frame(
-      K = k, variant = v, Q = gi$Q, p_pref = p_pref, Q_p_two = Q_p_two,
-      S = S, S_p = S_p, z_w = gi$z_w, z_deg = gi$z_deg, n_kept = gi$n_kept,
-      ARI_vs_base = align_ari(m_base, gi$m), stringsAsFactors = FALSE
-    )
-  }, future.seed = TRUE) |> dplyr::bind_rows()
+      
+      Q_p_two <- {
+        Bw <- sum(is.finite(gi$Q_null_w))
+        if (Bw > 0) {
+          mu <- mean(gi$Q_null_w, na.rm = TRUE)
+          sd <- stats::sd(gi$Q_null_w, na.rm = TRUE)
+          if (is.finite(mu) && is.finite(sd) && sd > 0) 2 * stats::pnorm(-abs((gi$Q - mu) / sd)) else NA_real_
+        } else { NA_real_ }
+      }
+      
+      S <- NA_real_
+      lab_all <- as.integer(gi$m)
+      kk <- gi$kept_idx
+      if (length(kk) > 1L) {
+        lab_k <- as.integer(factor(lab_all[kk]))
+        tabk <- table(lab_k)
+        keep_lab <- as.integer(names(tabk)[tabk >= 2L]) 
+        sel_k <- lab_k %in% keep_lab
+        if (sum(sel_k) >= 2L && length(keep_lab) >= 2L) {
+          Dk <- as.matrix(D_dx)[kk, kk, drop = FALSE]
+          Sil <- try(cluster::silhouette(lab_k[sel_k], as.dist(Dk[sel_k, sel_k, drop = FALSE])), silent = TRUE)
+          if (!inherits(Sil, "try-error")) S <- mean(Sil[, "sil_width"], na.rm = TRUE)
+        }
+      }
+      
+      S_p <- NA_real_
+      if (is.finite(S)) {
+        ids_all <- as.character(DXu_id$participant_id)
+        cs <- compute_silhouette_with_colshuffle(DX, ids_all, kept_idx = kk[sel_k], labs_kept = lab_k[sel_k], reps = SIL_REPS, seed = seed_vec[i] + 1e5L)
+        S <- cs$S_obs
+        S_p <- cs$S_p
+      }
+      
+      data.frame(
+        K = k, variant = v, Q = gi$Q, p_pref = p_pref, Q_p_two = Q_p_two,
+        S = S, S_p = S_p, z_w = gi$z_w, z_deg = gi$z_deg, n_kept = gi$n_kept,
+        ARI_vs_base = align_ari(m_base, gi$m), stringsAsFactors = FALSE
+      )
+    }, future.seed = TRUE) |> dplyr::bind_rows()
   
   write_csv(sens, "clustering_sensitivity_grid.csv")
   
@@ -1290,7 +1294,6 @@ baseline <- get_membership(
 base_m <- baseline$m
 
 grid <- expand.grid(K = K_GRID, variant = VARIANT_GRID, stringsAsFactors = FALSE)
-future::plan(future::multisession, workers = NCORES_PAR)
 
 jobs <- do.call(rbind, lapply(seq_len(nrow(grid)), function(i) {
   data.frame(i = i, K = grid$K[i], variant = grid$variant[i], seed = SEED_BOOT + seq_len(SWEEP_BOOT_B), stringsAsFactors = FALSE)
@@ -1299,7 +1302,7 @@ jobs <- do.call(rbind, lapply(seq_len(nrow(grid)), function(i) {
 progressr::handlers(global = TRUE)
 boot_raw <- progressr::with_progress({
   p <- progressr::progressor(steps = nrow(jobs))
-  res <- future_lapply(seq_len(nrow(jobs)), function(j) {
+  res <- FUTURE_LAPPLY(seq_len(nrow(jobs)), function(j) {
     k <- jobs$K[j]; v <- jobs$variant[j]; s <- jobs$seed[j]
     gi <- get_membership(D_dx, k = k, variant = v, mult = multU, B = N_PERM, deg_reps = DEG_REPS, null_scope = NULL_SCOPE, seed = s, local_scale = LOCAL_SCALE)
     p()
@@ -1377,16 +1380,14 @@ boot_one <- function(b) {
   list(success = success, trials = trials, valid = valid)
 }
 
-future::plan(future::multisession, workers = NCORES_PAR)
 progressr::handlers(global = TRUE)
 res <- progressr::with_progress({
   p <- progressr::progressor(steps = MAJORS_BOOT_B)
-  parts <- future.apply::future_lapply(seq_len(MAJORS_BOOT_B), function(b) {
+  parts <- FUTURE_LAPPLY(seq_len(MAJORS_BOOT_B), function(b) {
     x <- boot_one(b); p(); x
   }, future.seed = TRUE)
   parts
 })
-future::plan(future::sequential)
 
 success_by_dx <- Reduce(`+`, lapply(res, `[[`, "success"), init = zero_vec())
 trials_by_dx <- Reduce(`+`, lapply(res, `[[`, "trials"), init = zero_vec())
