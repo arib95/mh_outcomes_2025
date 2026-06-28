@@ -2445,6 +2445,67 @@ write_csv(MET, file.path(OUT_SUBDIR, "behaviour_map_metrics.csv"))
 # 10. Plotting Worker & Execution
 # ==============================================================================
 
+filter_plot_jobs_by_oof_low <- function(job_files,
+                                        MET_dt,
+                                        enabled = PLOT_FILTER_BY_OOF_LOW,
+                                        threshold = PLOT_OOF_LOW_MIN,
+                                        out_subdir = OUT_SUBDIR,
+                                        tag = "plot") {
+  if (!isTRUE(enabled)) return(job_files)
+  if (!length(job_files)) return(job_files)
+  
+  threshold <- suppressWarnings(as.numeric(threshold))
+  if (!is.finite(threshold)) {
+    stop("[plot filter] PLOT_OOF_LOW_MIN must be finite when PLOT_FILTER_BY_OOF_LOW=TRUE.")
+  }
+  if (is.null(MET_dt) || !nrow(MET_dt)) {
+    warning("[plot filter] No metrics table available; no plot jobs will be rendered.")
+    return(character(0))
+  }
+  
+  low_col <- if ("oof_low" %in% names(MET_dt)) {
+    "oof_low"
+  } else if ("oof_lo" %in% names(MET_dt)) {
+    "oof_lo"
+  } else {
+    NA_character_
+  }
+  if (is.na(low_col)) {
+    warning("[plot filter] Metrics table has no oof_low/oof_lo column; no plot jobs will be rendered.")
+    return(character(0))
+  }
+  
+  keys <- sub("^job_", "", sub("\\.rds$", "", basename(job_files)))
+  metric_index <- match(keys, as.character(MET_dt$var))
+  oof_low <- rep(NA_real_, length(keys))
+  ok_match <- !is.na(metric_index)
+  oof_low[ok_match] <- suppressWarnings(as.numeric(MET_dt[[low_col]][metric_index[ok_match]]))
+  keep <- is.finite(oof_low) & oof_low >= threshold
+  
+  report <- data.frame(
+    job = basename(job_files),
+    var = keys,
+    oof_low = oof_low,
+    threshold = threshold,
+    plotted = keep,
+    reason = ifelse(
+      keep,
+      "kept",
+      ifelse(is.na(metric_index), "missing_metrics_row",
+             ifelse(is.finite(oof_low), "below_threshold", "nonfinite_oof_low"))
+    ),
+    stringsAsFactors = FALSE
+  )
+  write_csv(report, file.path(out_subdir, paste0("plot_filter_oof_low_", tag, ".csv")))
+  
+  message(sprintf(
+    "[plot filter] %s: keeping %d/%d jobs with %s >= %.3f.",
+    tag, sum(keep), length(keep), low_col, threshold
+  ))
+  
+  job_files[keep]
+}
+
 plot_worker <- function(job, OUT_SUBDIR, MET_dt = NULL, OOF_PERM_B = 200) {
   nm <- job$key
   s <- job$sub_stats
@@ -2706,29 +2767,33 @@ if (length(JOBS) > 0) {
   rm(JOBS, res_list)
   gc()
   
-  message("Rendering plots...")
+  job_files <- filter_plot_jobs_by_oof_low(job_files, MET_dt, tag = "pass2")
   
-  progressr::with_progress({
-    p <- progressr::progressor(steps = length(job_files))
+  if (length(job_files) > 0L) {
+    message(sprintf("Rendering %d plot jobs...", length(job_files)))
     
-    invisible(FUTURE_LAPPLY(
-      job_files, 
-      function(fpath) {
-        if (requireNamespace("RhpcBLASctl", quietly = TRUE)) RhpcBLASctl::blas_set_num_threads(1)
-        data.table::setDTthreads(1)
-        
-        job_data <- readRDS(fpath)
-        
-        tryCatch(plot_worker(job_data, OUT_SUBDIR, MET_dt), error = function(e) {
-          message(sprintf("Error plotting %s: %s", job_data$key, e$message))
-        })
-        
-        p()
-        NULL
-      }, 
-      future.seed = TRUE
-    ))
-  })
+    progressr::with_progress({
+      p <- progressr::progressor(steps = length(job_files))
+      
+      invisible(FUTURE_LAPPLY(
+        job_files, 
+        function(fpath) {
+          if (requireNamespace("RhpcBLASctl", quietly = TRUE)) RhpcBLASctl::blas_set_num_threads(1)
+          data.table::setDTthreads(1)
+          
+          job_data <- readRDS(fpath)
+          
+          tryCatch(plot_worker(job_data, OUT_SUBDIR, MET_dt), error = function(e) {
+            message(sprintf("Error plotting %s: %s", job_data$key, e$message))
+          })
+          
+          p()
+          NULL
+        }, 
+        future.seed = TRUE
+      ))
+    })
+  }
 }
 if (is_dx_mode) saveRDS(DX_FITS, file.path(OUT_SUBDIR, "dx_gam_fits.rds"))
 

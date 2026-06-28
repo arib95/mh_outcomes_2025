@@ -108,7 +108,7 @@ PALETTE_DIRECTION  <- 1L
 PALETTE_COLOURS    <- NULL
 
 # Global toggles
-BASE_DIM        <- 3L
+BASE_DIM        <- 2L
 USE_3WAY_TENSOR <- FALSE
 GAM_FULL        <- FALSE
 DO_PLOTS        <- TRUE
@@ -202,7 +202,7 @@ VARIANT_GRID <- c("union", "mutual")
 SWEEP_BOOT_B <- 25L
 
 # Weights
-WEIGHTING_MODE        <- "uniform"  # id_guided | uniform
+WEIGHTING_MODE        <- "id_guided"  # id_guided | uniform
 TREAT_ORDINALS_AS_NOMINAL <- TRUE
 TREAT_BINNED_CONTINUOUS_AS_NOMINAL <- FALSE
 COERCE_NUMERIC_01_TO_FACTOR <- FALSE
@@ -212,17 +212,17 @@ W_MIN                <- 0.01
 W_STEP_GRID          <- c(0.95, 0.90, 0.75)
 W_BATCH_K            <- 3L
 W_BATCH_FACTOR       <- 0.75
-W_MAX_ITERS          <- 2000L
+W_MAX_ITERS          <- 3000L
 # Multi-run row coverage:
 # If FIX_REP_SUBSET=TRUE, every run uses the same first N_ROWS_SUB optimiser rows.
 # If FIX_REP_SUBSET=FALSE, runs sample independently; expected unique coverage is
 # pool_n * (1 - (1 - N_ROWS_SUB / pool_n)^GOWER_MULTI_RUNS), not N_ROWS_SUB * runs.
 # Example: pool_n=3000, N_ROWS_SUB=250, runs=12 covers about 1944 unique rows.
-N_ROWS_SUB           <- 250L
+N_ROWS_SUB           <- 500L
 FIX_REP_SUBSET       <- FALSE
 GOWER_MULTI_RUNS     <- 35L
 GOWER_MULTI_MIN_PROP <- 0.35
-GOWER_MULTI_ENABLE   <- TRUE
+GOWER_MULTI_ENABLE   <- FALSE
 GOWER_ACTIVE_EPS     <- 1e-8
 DO_RESIDUALISATION   <- FALSE
 KNEE_THR             <- 0.02
@@ -335,7 +335,7 @@ OUT_SUBDIR    <- "tobis_out"
 vars_keep   <- NULL
 write_plots <- DO_PLOTS
 PLOT_FILTER_BY_OOF_LOW <- TRUE
-PLOT_OOF_LOW_MIN       <- 0.70
+PLOT_OOF_LOW_MIN       <- 0.50
 
 MAX_K       <- 8L
 MIN_POS     <- 15L
@@ -351,7 +351,7 @@ OOF_MAX_PAIRS <- 2e6
 OOF_PERM_B    <- 200L
 
 # Inputs
-PSY_CSV     <- "data/embedding.csv"
+PSY_CSV     <- "data/psychometric_matrix.csv"
 DX_OPTIONAL <- TRUE
 DIAG_CSV    <- "data/wide_diagnoses.csv"
 
