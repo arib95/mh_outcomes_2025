@@ -5,6 +5,8 @@ suppressPackageStartupMessages({
   library(utils)
   library(grDevices)
   library(Matrix)
+  library(matrixStats)
+  library(tools)
   
   # Data
   library(readr)
@@ -32,6 +34,8 @@ suppressPackageStartupMessages({
   library(ggrepel)
   library(webshot2)
   library(patchwork)
+  library(plotly)
+  library(ks)
   
   # Domain / extras
   library(igraph)
@@ -77,7 +81,7 @@ SEED_BOOT    <- SEED_GLOBAL
 OOF_SEED     <- SEED_GLOBAL
 
 # Compute / threading
-default_setup_cfg <- list(
+default_threading_options <- list(
   BAM_THREADS = "all_but_one",
   SET_ENV_THREADS = TRUE,
   OMP_THREADS = 1L,
@@ -88,13 +92,13 @@ default_setup_cfg <- list(
 if (!exists("SETUP_CFG", inherits = FALSE) || is.null(SETUP_CFG)) {
   SETUP_CFG <- list()
 }
-setup_cfg <- utils::modifyList(default_setup_cfg, SETUP_CFG)
-BAM_THREADS <- setup_cfg$BAM_THREADS
-SET_ENV_THREADS <- setup_cfg$SET_ENV_THREADS
-OMP_THREADS <- setup_cfg$OMP_THREADS
-BLAS_THREADS <- setup_cfg$BLAS_THREADS
-NCORES_PAR <- setup_cfg$NCORES_PAR
-FUTURE_GLOBALS_MAXSIZE <- setup_cfg$FUTURE_GLOBALS_MAXSIZE
+threading_options <- utils::modifyList(default_threading_options, SETUP_CFG)
+BAM_THREADS <- threading_options$BAM_THREADS
+SET_ENV_THREADS <- threading_options$SET_ENV_THREADS
+OMP_THREADS <- threading_options$OMP_THREADS
+BLAS_THREADS <- threading_options$BLAS_THREADS
+NCORES_PAR <- threading_options$NCORES_PAR
+FUTURE_GLOBALS_MAXSIZE <- threading_options$FUTURE_GLOBALS_MAXSIZE
 
 # Palette / plotting defaults
 PALETTE_ENGINE     <- "scico"
@@ -104,11 +108,14 @@ PALETTE_DIRECTION  <- 1L
 PALETTE_COLOURS    <- NULL
 
 # Global toggles
+BASE_DIM        <- 3L
+USE_3WAY_TENSOR <- FALSE
+GAM_FULL        <- FALSE
 DO_PLOTS        <- TRUE
 DO_DIAGNOSTICS  <- TRUE
 DO_SURFACE      <- TRUE
 DO_SWEEP        <- TRUE
-RUN_PRINSURF    <- TRUE
+RUN_PRINSURF    <- FALSE
 USE_SURFACE_CV  <- TRUE
 DO_DELTAQ       <- TRUE
 DO_CORR_TRIM    <- FALSE
@@ -148,14 +155,14 @@ BF_DENS_K      <- 30L
 
 # Nulls / resampling
 N_PERM            <- 200L
-DEG_REPS          <- N_PERM
+DEG_REPS          <- 500L
 NULL_SCOPE        <- "kept"    # kept | full
-N_BOOT            <- 200L
+N_BOOT            <- 1000L
 SIL_REPS          <- 200L
 COL_SHUFFLE_REPS  <- 200L
 CV_FOLDS          <- 5L
 SIG_METHOD        <- "perm"
-SIG_FWER          <- 0.95
+SIG_FWER          <- 0.05
 PRED_BOOT         <- 200L
 
 # Features / guards
@@ -185,31 +192,60 @@ AUC_MIN        <- 0.70
 PREV_MIN       <- 0.03
 NCASE_MIN      <- 5L
 NIN_MIN        <- 5L
-NOUT_MIN       <- 5L
+NOUT_MIN       <- 0L
 MAJORS_BOOT_B  <- 200L
 PILLAR_B_REPS  <- 200L
 
 # Clusters
 K_GRID       <- c(5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15)
 VARIANT_GRID <- c("union", "mutual")
-SWEEP_BOOT_B <- 200L
+SWEEP_BOOT_B <- 25L
 
 # Weights
-WEIGHTING_MODE        <- "id_guided"  # id_guided | uniform
+WEIGHTING_MODE        <- "uniform"  # id_guided | uniform
 TREAT_ORDINALS_AS_NOMINAL <- TRUE
+TREAT_BINNED_CONTINUOUS_AS_NOMINAL <- FALSE
+COERCE_NUMERIC_01_TO_FACTOR <- FALSE
+COERCE_SMALL_INT_NUMERIC_TO_FACTOR <- FALSE
 MISSING_AS_NOMINAL_LEVEL  <- TRUE
-W_MIN                <- 0.05
-W_STEP_GRID          <- c(0.95, 0.90, 0.75, 0.5, 0.25, 0.10, 0.05)
+W_MIN                <- 0.01
+W_STEP_GRID          <- c(0.95, 0.90, 0.75)
 W_BATCH_K            <- 3L
 W_BATCH_FACTOR       <- 0.75
-W_MAX_ITERS          <- NA_integer_
-N_ROWS_SUB           <- 1000L
-FIX_REP_SUBSET       <- TRUE
-GOWER_MULTI_RUNS     <- 10L
+W_MAX_ITERS          <- 2000L
+# Multi-run row coverage:
+# If FIX_REP_SUBSET=TRUE, every run uses the same first N_ROWS_SUB optimiser rows.
+# If FIX_REP_SUBSET=FALSE, runs sample independently; expected unique coverage is
+# pool_n * (1 - (1 - N_ROWS_SUB / pool_n)^GOWER_MULTI_RUNS), not N_ROWS_SUB * runs.
+# Example: pool_n=3000, N_ROWS_SUB=250, runs=12 covers about 1944 unique rows.
+N_ROWS_SUB           <- 250L
+FIX_REP_SUBSET       <- FALSE
+GOWER_MULTI_RUNS     <- 35L
 GOWER_MULTI_MIN_PROP <- 0.35
-GOWER_MULTI_ENABLE   <- FALSE
+GOWER_MULTI_ENABLE   <- TRUE
 GOWER_ACTIVE_EPS     <- 1e-8
-RUN_RESIDUAL_DIAGNOSTICS <- TRUE
+DO_RESIDUALISATION   <- FALSE
+KNEE_THR             <- 0.02
+SHT_CONT             <- TRUE
+CONT_AS_ORD          <- TRUE
+CONT_BINS            <- 10L
+CONT_JITTER_FRAC     <- if (isFALSE(CONT_AS_ORD)) 0.05 else NULL
+CONT_WINSOR_Q        <- c(0.05, 0.95)
+REPORT_LOW_SUPPORT_NUMERIC <- TRUE
+DROP_LOW_SUPPORT_NUMERIC   <- FALSE
+LOW_SUPPORT_NUMERIC_MAX_UNIQUE <- 10L
+LOW_SUPPORT_NUMERIC_MIN_PROP   <- RARE_LEVEL_MIN_PROP
+LOW_SUPPORT_NUMERIC_MIN_N      <- 5L
+REPORT_PREDICTOR_MISSINGNESS <- TRUE
+DROP_HIGH_MISSING_PREDICTORS <- TRUE
+MAX_PREDICTOR_MISSING_PROP   <- 0.20
+GOWER_REQUIRE_SUBSET_SUPPORT   <- TRUE
+GOWER_SUBSET_MIN_LEVEL_PROP    <- RARE_LEVEL_MIN_PROP
+GOWER_SUBSET_MIN_LEVEL_N       <- 3L
+GOWER_L1             <- 0
+GOWER_L2             <- 0
+LOCK_VARS            <- c()
+LOCK_VARS            <- make.names(LOCK_VARS, unique = FALSE)
 
 # Dedup / diagnostics
 DO_DEDUP         <- TRUE
@@ -242,7 +278,7 @@ DIAG_N_MAX      <- 4000L
 
 # Core sweep / optimisation
 PCL_K_MIN       <- 2L
-PCL_K_MAX       <- 4L
+PCL_K_MAX       <- 5L
 PCL_LAMBDA_GRID <- c(0, 0.05, 0.1, 0.2, 0.4, 0.8)
 PCL_KNN_BASE    <- 12L
 PCL_LOCAL_SCALE <- TRUE
@@ -260,26 +296,26 @@ PCL_RESEED_MAX      <- 3L
 PCL_ENTROPY_PUSH    <- 1e-3
 
 # Selection weights / penalties
-PCL_W_Q       <- 0.45
-PCL_W_SNN     <- 0.50
-PCL_W_REC     <- 0.20
-PCL_W_SIL     <- 0.15
+PCL_W_Q       <- 0.15
+PCL_W_SNN     <- 0.20
+PCL_W_REC     <- 0.55
+PCL_W_SIL     <- 0.00
 PCL_PEN_EMPTY <- 0.60
 PCL_PEN_IMB   <- 0.15
-PCL_PEN_RED   <- 0.30
+PCL_PEN_RED   <- 0.02
 
 # Leiden
 LEIDEN_MEMBERSHIP_CSV <- "cluster_membership_all_participants.csv"
 USE_LEIDEN_K          <- FALSE
 
 # Plot behaviour
-USE_RAGG      <- FALSE
+USE_RAGG      <- TRUE
 MM_UNITS      <- FALSE
 GRID_N_B      <- 400L
-GRID_N_U      <- 400L
+GRID_N_U      <- 140L
 CONTOUR_PROBS <- c(0.15, 0.25, 0.40, 0.60, 0.80)
 CALIB_SHOWPTS <- TRUE
-CL_DRAW_HULLS <- TRUE
+CL_DRAW_HULLS <- FALSE
 
 # k-NN stability plot
 STAB_K_RANGE <- c(10L, 11L, 12L, 13L, 14L, 15L, 16L, 17L, 18L, 19L, 20L)
@@ -287,15 +323,19 @@ STAB_SD_GRID <- c(0, 0.05, 0.10, 0.15, 0.20)
 STAB_REPS    <- 600L
 
 # Outcome plots
-behaviour_csv <- "data/wide_diagnoses.csv"
-OUT_SUBDIR    <- "wide_diagnoses"
+# behaviour_csv <- "data/wide_diagnoses.csv"
+# OUT_SUBDIR    <- "wide_diagnoses"
 # behaviour_csv <- "data/cluster_membership_all_participants.csv"
 # OUT_SUBDIR    <- "clusters"
-# behaviour_csv <- "data/hopkins.csv"
-# OUT_SUBDIR    <- "hopkins"
+# behaviour_csv <- "data/psychometric_matrix.csv"
+# OUT_SUBDIR    <- "psychometric_matrix"
+behaviour_csv <- "data/projection.csv"
+OUT_SUBDIR    <- "tobis_out"
 
 vars_keep   <- NULL
 write_plots <- DO_PLOTS
+PLOT_FILTER_BY_OOF_LOW <- TRUE
+PLOT_OOF_LOW_MIN       <- 0.70
 
 MAX_K       <- 8L
 MIN_POS     <- 15L
@@ -311,7 +351,7 @@ OOF_MAX_PAIRS <- 2e6
 OOF_PERM_B    <- 200L
 
 # Inputs
-PSY_CSV     <- "data/psychometric_matrix.csv"
+PSY_CSV     <- "data/embedding.csv"
 DX_OPTIONAL <- TRUE
 DIAG_CSV    <- "data/wide_diagnoses.csv"
 
