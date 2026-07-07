@@ -165,33 +165,44 @@ DX <- merge(base_dt, DT, by = "participant_id", all = FALSE)
 # Load residuals (XR) for stacking analysis, ensuring strict alignment with DX.
 XR <- NULL
 if (file.exists(file.path(OUTPUTS_DIR, "Fprime_matrix.rds"))) {
-  tmp_res <- readRDS("Fprime_matrix.rds")
+  tmp_res <- readRDS(file.path(OUTPUTS_DIR, "Fprime_matrix.rds"))
   if (is.list(tmp_res)) {
-    mat_to_use <- if ("XR" %in% names(tmp_res)) tmp_res$XR else tmp_res$Fprime
-    ix <- match(DX$participant_id, tmp_res$participant_id)
-
-    if (anyNA(ix)) {
-      warning("[setup] Missing participants in residuals file. Filtering DX to intersection.")
-      keep_rows <- !is.na(ix)
-      DX <- DX[keep_rows, ]
-      ix <- match(DX$participant_id, tmp_res$participant_id)
-
-      if (exists("geom") && !is.null(geom$U)) {
-        U_full <- geom$U
-        if (!is.null(rownames(U_full)) && all(DX$participant_id %in% rownames(U_full))) {
-          U_DX <- U_full[DX$participant_id, , drop = FALSE]
-        } else {
-          U_DX <- NULL
-        }
-      }
+    mat_to_use <- if ("XR" %in% names(tmp_res) && !is.null(tmp_res$XR)) {
+      tmp_res$XR
+    } else if ("Fprime" %in% names(tmp_res) && !is.null(tmp_res$Fprime)) {
+      tmp_res$Fprime
+    } else {
+      NULL
     }
 
-    if (nrow(DX) > 0 && !anyNA(ix)) {
-      XR <- mat_to_use[ix, , drop = FALSE]
-      message("[setup] Loaded Residuals (XR) for stacking (n=", nrow(DX), ").")
+    if (is.null(mat_to_use) || is.null(dim(mat_to_use)) || ncol(mat_to_use) == 0L) {
+      warning("[setup] Residual export has no XR/Fprime matrix. Stacking disabled; rerun 1_dimension_psychometric.R with DO_RESIDUALISATION=TRUE.")
     } else {
-      warning("[setup] No participant intersection found. Stacking disabled.")
-      XR <- NULL
+      ix <- match(DX$participant_id, tmp_res$participant_id)
+
+      if (anyNA(ix)) {
+        warning("[setup] Missing participants in residuals file. Filtering DX to intersection.")
+        keep_rows <- !is.na(ix)
+        DX <- DX[keep_rows, ]
+        ix <- match(DX$participant_id, tmp_res$participant_id)
+
+        if (exists("geom") && !is.null(geom$U)) {
+          U_full <- geom$U
+          if (!is.null(rownames(U_full)) && all(DX$participant_id %in% rownames(U_full))) {
+            U_DX <- U_full[DX$participant_id, , drop = FALSE]
+          } else {
+            U_DX <- NULL
+          }
+        }
+      }
+
+      if (nrow(DX) > 0 && !anyNA(ix)) {
+        XR <- mat_to_use[ix, , drop = FALSE]
+        message("[setup] Loaded Residuals (XR) for stacking (n=", nrow(DX), ").")
+      } else {
+        warning("[setup] No participant intersection found. Stacking disabled.")
+        XR <- NULL
+      }
     }
   } else {
     # Handle raw matrix input

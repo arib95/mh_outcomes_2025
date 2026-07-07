@@ -374,13 +374,21 @@ write_dx_auc_comparison_table <- function(
   
   # 2. Add Counts (n_pos / N)
   CNT <- tibble::tibble(
-    var   = names(DxW_A),
-    n_pos = colSums(DxW_A > 0, na.rm = TRUE),
-    N     = nrow(DxW_A)
+    var         = names(DxW_A),
+    n_pos_count = colSums(DxW_A > 0, na.rm = TRUE),
+    N_count     = nrow(DxW_A)
   )
   
   DF <- MET %>% 
     dplyr::left_join(CNT, by = "var")
+
+  if (!"n_pos" %in% names(DF)) DF$n_pos <- NA_real_
+  if (!"n" %in% names(DF)) DF$n <- NA_real_
+  DF <- DF %>%
+    dplyr::mutate(
+      n_pos_table = dplyr::coalesce(as.numeric(n_pos_count), as.numeric(n_pos)),
+      N_table = dplyr::coalesce(as.numeric(N_count), as.numeric(n))
+    )
   
   # 3. Formatting Helpers
   fmt3 <- function(x) ifelse(is.finite(x), sprintf("%.3f", as.numeric(x)), "NA")
@@ -400,7 +408,11 @@ write_dx_auc_comparison_table <- function(
   OUT <- DF %>%
     dplyr::transmute(
       Diagnosis = var,
-      `n+/N (%)` = sprintf("%d/%d (%.1f%%)", n_pos, N, 100 * n_pos / N),
+      `n+/N (%)` = ifelse(
+        is.finite(n_pos_table) & is.finite(N_table) & N_table > 0,
+        sprintf("%d/%d (%.1f%%)", as.integer(n_pos_table), as.integer(N_table), 100 * n_pos_table / N_table),
+        "NA"
+      ),
       
       # Base Model (The Surface)
       `Base AUC (GAM)` = fmt_ci(oof_point, oof_lo, oof_hi),

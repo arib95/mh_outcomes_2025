@@ -4,8 +4,37 @@
 # Needs to be run after running dimension_contplot as "wide_diagnoses" so
 # its XR is kept in environment.
 
+`%||%` <- function(a, b) if (is.null(a) || length(a) == 0) b else a
+
+char_to_num_local <- function(v) {
+  if (is.numeric(v)) return(v)
+  if (is.factor(v) || is.logical(v)) v <- as.character(v)
+  if (!is.character(v)) return(v)
+  s <- gsub("\\s+", "", v)
+  s <- sub("%$", "", s)
+  v2 <- suppressWarnings(as.numeric(gsub(",", ".", s)))
+  non_blank <- !is.na(s) & nzchar(s)
+  prop_num <- if (any(non_blank)) sum(is.finite(v2[non_blank])) / sum(non_blank) else 0
+  if (prop_num >= 0.80) v2 else v
+}
+
 probe_residual_signal <- function(target_var, dx_data, xr_matrix, geom_u, top_n = 20) {
   
+  if (!"participant_id" %in% names(dx_data)) stop("dx_data must contain participant_id.")
+  if (is.null(rownames(xr_matrix))) stop("xr_matrix must have participant_id rownames.")
+  if (is.null(rownames(geom_u))) stop("geom_u must have participant_id rownames.")
+
+  common_id <- Reduce(intersect, list(
+    as.character(dx_data$participant_id),
+    rownames(xr_matrix),
+    rownames(geom_u)
+  ))
+  if (!length(common_id)) stop("No overlapping participant_id values across DX, XR, and geom_u.")
+
+  dx_data <- dx_data[match(common_id, as.character(dx_data$participant_id)), , drop = FALSE]
+  xr_matrix <- xr_matrix[common_id, , drop = FALSE]
+  geom_u <- geom_u[common_id, , drop = FALSE]
+
   # Diagnosis vector coded as binary 0/1.
   if (!target_var %in% names(dx_data)) stop("Variable not found in DX.")
   y <- as.numeric(dx_data[[target_var]])
@@ -32,7 +61,7 @@ probe_residual_signal <- function(target_var, dx_data, xr_matrix, geom_u, top_n 
   cors <- cor(XR, y, method = "spearman", use = "pairwise.complete.obs")
   
   res <- data.frame(
-    item = rownames(cors),
+    item = rownames(cors) %||% colnames(XR),
     cor_residual = as.numeric(cors)
   )
   
@@ -63,11 +92,11 @@ DT <- data.table::fread(
   na.strings = c("", "NA", "N/A", "NaN", "nan", "null", "NULL", ".", "-"),
   strip.white = TRUE
 )
-DT <- as.data.table(lapply(DT, char_to_num))
+DT <- as.data.table(lapply(DT, char_to_num_local))
 stopifnot("participant_id" %in% names(DT))
 DT[, participant_id := as.character(participant_id)]
 
-DX <- merge(base_dt, DT, by = "participant_id", all = FALSE)
+DX <- merge(base_dt, DT, by = "participant_id", all = FALSE, sort = FALSE)
 
 # 1. Probe schizophrenia.
 probe_residual_signal("SCID.DIAG.Schizophrenia", DX, XR, geom$U)
