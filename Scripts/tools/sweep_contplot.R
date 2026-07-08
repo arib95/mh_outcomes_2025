@@ -3,7 +3,7 @@
 # setup.R already references via the default `behaviour_csv`.
 
 # --------- config toggles (optional) ----------
-SKIP_IF_METRICS_EXIST <- FALSE   # set TRUE to skip if metrics already present
+SKIP_IF_METRICS_EXIST <- TRUE   # set TRUE to skip if metrics already present
 STOP_ON_ERROR         <- TRUE   # set TRUE to halt on firsailure
 
 # --------- bootstrap project context ----------
