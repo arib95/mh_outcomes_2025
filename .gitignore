@@ -2,3 +2,8 @@
 .Rhistory
 .RData
 .Ruserdata
+.DS_Store
+._*
+Artefacts/LA5c_20260708-230818.tar.gz
+Artefacts/*.tar.gz
+Artefacts/*.tar.gz.part*
