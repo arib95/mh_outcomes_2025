@@ -1,42 +1,50 @@
 # External artefact archives
 
-Large release artefacts are hosted on Zenodo record 21269864:
+The LA5c and TCP reproducibility archives are hosted on Zenodo:
 
-https://zenodo.org/records/21269864
+- Record: https://zenodo.org/records/21269864
+- DOI: https://doi.org/10.5281/zenodo.21269864
 
-The Git repository tracks these files through git-annex URLs plus portable checksum files.
+The Git repository tracks the split archive parts with git-annex. Portable per-part and reassembled-archive checksums are retained alongside them.
 
-## Files
+## Hosted files
 
-| Archive | File | MD5 from Zenodo | Size | URL |
-| --- | --- | --- | --- | --- |
-| LA5c | LA5c_20260708-230818.tar.gz.partaa | 3f8ab546a0ed112566c0ac77605931e0 | 5.4 GB | https://zenodo.org/records/21269864/files/LA5c_20260708-230818.tar.gz.partaa?download=1 |
-| LA5c | LA5c_20260708-230818.tar.gz.partab | f33d1bd6727fcf9ecb5dc3396bea45de | 5.4 GB | https://zenodo.org/records/21269864/files/LA5c_20260708-230818.tar.gz.partab?download=1 |
-| LA5c | LA5c_20260708-230818.tar.gz.partac | e5dc426f65d8218d2169775ab93fbae4 | 5.4 GB | https://zenodo.org/records/21269864/files/LA5c_20260708-230818.tar.gz.partac?download=1 |
-| LA5c | LA5c_20260708-230818.tar.gz.partad | 8dc6178dda0e7f090fdddcff5e480fc2 | 2.0 GB | https://zenodo.org/records/21269864/files/LA5c_20260708-230818.tar.gz.partad?download=1 |
-| TCP | TCP_20260708-230205.tar.gz | a93eb40d463168d695eb2cef55e53a8a | 4.7 GB | https://zenodo.org/records/21269864/files/TCP_20260708-230205.tar.gz?download=1 |
+| Archive | File | Size | Zenodo MD5 |
+| --- | --- | ---: | --- |
+| LA5c | `LA5c_20260722-130855.tar.gz.partaa` | 5.369 GB | `4fd5615b72fada13314fd58c5d97e88a` |
+| LA5c | `LA5c_20260722-130855.tar.gz.partab` | 5.369 GB | `ca3b2217d03c4e5795e461b469b095fe` |
+| LA5c | `LA5c_20260722-130855.tar.gz.partac` | 5.369 GB | `31cae6cfaa9e8364850b959bc7eb2584` |
+| LA5c | `LA5c_20260722-130855.tar.gz.partad` | 5.369 GB | `98dc692133e39be0b28e01e51a64b8df` |
+| LA5c | `LA5c_20260722-130855.tar.gz.partae` | 3.668 GB | `46f8e22574e22d64b1eda2cff3b36aa7` |
+| TCP | `TCP_20260722-130902.tar.gz.partaa` | 5.369 GB | `c82368db248d5487056b116cd18cf5a6` |
+| TCP | `TCP_20260722-130902.tar.gz.partab` | 5.369 GB | `9fae3f0be1f2f5cad94096e3bbb00fba` |
+| TCP | `TCP_20260722-130902.tar.gz.partac` | 5.369 GB | `89e9f755134aa31e3aa749b203f41885` |
+| TCP | `TCP_20260722-130902.tar.gz.partad` | 5.369 GB | `59c5029b039004342c56d44aaaec5999` |
+| TCP | `TCP_20260722-130902.tar.gz.partae` | 0.158 GB | `448d4f0736d56570af28be7530d76f08` |
 
-## Restore
+Permanent file URLs and both MD5 and SHA-256 values are recorded in `zenodo_upload_manifest.tsv`.
 
-With git-annex installed, retrieve the hosted files:
+## Restore with git-annex
 
-```bash
-git annex get Artefacts/LA5c_20260708-230818.tar.gz.partaa \
-  Artefacts/LA5c_20260708-230818.tar.gz.partab \
-  Artefacts/LA5c_20260708-230818.tar.gz.partac \
-  Artefacts/LA5c_20260708-230818.tar.gz.partad \
-  Artefacts/TCP_20260708-230205.tar.gz
-```
-
-Reassemble LA5c and verify both archives:
+From the repository root:
 
 ```bash
+git annex get 'Artefacts/LA5c_20260722-130855.tar.gz.part??' \
+  'Artefacts/TCP_20260722-130902.tar.gz.part??'
+
 cd Artefacts
-cat LA5c_20260708-230818.tar.gz.partaa \
-  LA5c_20260708-230818.tar.gz.partab \
-  LA5c_20260708-230818.tar.gz.partac \
-  LA5c_20260708-230818.tar.gz.partad \
-  > LA5c_20260708-230818.tar.gz
-shasum -a 256 -c LA5c_20260708-230818.tar.gz.sha256
-shasum -a 256 -c TCP_20260708-230205.tar.gz.sha256
+cat LA5c_20260722-130855.tar.gz.part?? > LA5c_20260722-130855.tar.gz
+cat TCP_20260722-130902.tar.gz.part?? > TCP_20260722-130902.tar.gz
+shasum -a 256 -c LA5c_20260722-130855.tar.gz.sha256
+shasum -a 256 -c TCP_20260722-130902.tar.gz.sha256
 ```
+
+## Restore without git-annex
+
+From `Artefacts/`, run:
+
+```bash
+./fetch_from_zenodo.sh
+```
+
+The script resumes partial downloads, verifies every part against Zenodo's MD5, reassembles both archives, and verifies their SHA-256 checksums.

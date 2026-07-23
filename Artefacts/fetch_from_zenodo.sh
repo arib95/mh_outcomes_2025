@@ -2,63 +2,93 @@
 set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+manifest="$script_dir/zenodo_upload_manifest.tsv"
 cd "$script_dir"
 
-fetch() {
-  local url="$1"
-  local out="$2"
-  if [[ -s "$out" ]]; then
-    echo "exists: $out"
-  else
-    echo "downloading: $out"
-    curl -L --fail --continue-at - --output "$out" "$url"
-  fi
+[[ -f "$manifest" ]] || {
+  echo "Missing manifest: $manifest" >&2
+  exit 1
 }
 
-md5_check() {
-  local file="$1"
-  local expected="$2"
-  local observed
+file_size() {
+  stat -f '%z' "$1" 2>/dev/null || stat -c '%s' "$1"
+}
+
+md5_of() {
   if command -v md5sum >/dev/null 2>&1; then
-    observed="$(md5sum "$file" | awk '{print $1}')"
+    md5sum "$1" | awk '{print $1}'
   else
-    observed="$(md5 -q "$file")"
+    md5 -q "$1"
   fi
-  if [[ "$observed" != "$expected" ]]; then
-    echo "MD5 mismatch for $file" >&2
-    echo "expected: $expected" >&2
-    echo "observed: $observed" >&2
+}
+
+fetch_and_verify() {
+  local url="$1"
+  local file="$2"
+  local expected_bytes="$3"
+  local expected_md5="$4"
+  local actual_bytes observed_md5
+
+  if [[ -f "$file" ]]; then
+    actual_bytes="$(file_size "$file")"
+    if [[ "$actual_bytes" == "$expected_bytes" ]]; then
+      observed_md5="$(md5_of "$file")"
+      if [[ "$observed_md5" == "$expected_md5" ]]; then
+        echo "verified already: $file"
+        return
+      fi
+      echo "Complete-sized file has the wrong MD5: $file" >&2
+      exit 1
+    fi
+    if (( actual_bytes > expected_bytes )); then
+      echo "Local file is larger than expected: $file" >&2
+      exit 1
+    fi
+    echo "resuming: $file"
+  else
+    echo "downloading: $file"
+  fi
+
+  curl --location --fail --show-error \
+    --retry 5 --retry-all-errors --retry-delay 5 \
+    --continue-at - --output "$file" "$url"
+
+  actual_bytes="$(file_size "$file")"
+  [[ "$actual_bytes" == "$expected_bytes" ]] || {
+    echo "Size mismatch for $file: expected $expected_bytes, found $actual_bytes" >&2
     exit 1
-  fi
+  }
+  observed_md5="$(md5_of "$file")"
+  [[ "$observed_md5" == "$expected_md5" ]] || {
+    echo "MD5 mismatch for $file" >&2
+    exit 1
+  }
+  echo "verified: $file"
 }
 
-sha256_check() {
-  local manifest="$1"
-  if command -v sha256sum >/dev/null 2>&1; then
-    sha256sum -c "$manifest"
-  else
-    shasum -a 256 -c "$manifest"
-  fi
-}
+while IFS=$'\t' read -r archive file bytes size_gb md5 sha256 url; do
+  [[ "$file" == "file" || -z "$file" ]] && continue
+  [[ -n "$url" ]] || {
+    echo "Missing Zenodo URL for $file" >&2
+    exit 1
+  }
+  case "$file" in
+    LA5c_20260722-130855.tar.gz.part??|TCP_20260722-130902.tar.gz.part??) ;;
+    *)
+      echo "Unexpected filename in manifest: $file" >&2
+      exit 1
+      ;;
+  esac
+  fetch_and_verify "$url" "$file" "$bytes" "$md5"
+done < "$manifest"
 
-fetch 'https://zenodo.org/records/21269864/files/LA5c_20260708-230818.tar.gz.partaa?download=1' 'LA5c_20260708-230818.tar.gz.partaa'
-fetch 'https://zenodo.org/records/21269864/files/LA5c_20260708-230818.tar.gz.partab?download=1' 'LA5c_20260708-230818.tar.gz.partab'
-fetch 'https://zenodo.org/records/21269864/files/LA5c_20260708-230818.tar.gz.partac?download=1' 'LA5c_20260708-230818.tar.gz.partac'
-fetch 'https://zenodo.org/records/21269864/files/LA5c_20260708-230818.tar.gz.partad?download=1' 'LA5c_20260708-230818.tar.gz.partad'
-fetch 'https://zenodo.org/records/21269864/files/TCP_20260708-230205.tar.gz?download=1' 'TCP_20260708-230205.tar.gz'
+cat LA5c_20260722-130855.tar.gz.part?? > LA5c_20260722-130855.tar.gz
+cat TCP_20260722-130902.tar.gz.part?? > TCP_20260722-130902.tar.gz
 
-md5_check 'LA5c_20260708-230818.tar.gz.partaa' '3f8ab546a0ed112566c0ac77605931e0'
-md5_check 'LA5c_20260708-230818.tar.gz.partab' 'f33d1bd6727fcf9ecb5dc3396bea45de'
-md5_check 'LA5c_20260708-230818.tar.gz.partac' 'e5dc426f65d8218d2169775ab93fbae4'
-md5_check 'LA5c_20260708-230818.tar.gz.partad' '8dc6178dda0e7f090fdddcff5e480fc2'
-md5_check 'TCP_20260708-230205.tar.gz' 'a93eb40d463168d695eb2cef55e53a8a'
-
-cat \
-  LA5c_20260708-230818.tar.gz.partaa \
-  LA5c_20260708-230818.tar.gz.partab \
-  LA5c_20260708-230818.tar.gz.partac \
-  LA5c_20260708-230818.tar.gz.partad \
-  > LA5c_20260708-230818.tar.gz
-
-sha256_check 'LA5c_20260708-230818.tar.gz.sha256'
-sha256_check 'TCP_20260708-230205.tar.gz.sha256'
+if command -v sha256sum >/dev/null 2>&1; then
+  sha256sum -c LA5c_20260722-130855.tar.gz.sha256
+  sha256sum -c TCP_20260722-130902.tar.gz.sha256
+else
+  shasum -a 256 -c LA5c_20260722-130855.tar.gz.sha256
+  shasum -a 256 -c TCP_20260722-130902.tar.gz.sha256
+fi
