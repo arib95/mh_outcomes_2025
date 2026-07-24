@@ -1,4 +1,4 @@
-# Item-level psychometric embeddings across two transdiagnostic cohorts
+# Item-level psychometric data map continuous diagnostic and symptom fields across two transdiagnostic cohorts
 
 Analysis code for Ribeiro and Novais (2026), *Item-level psychometric data map continuous diagnostic and symptom fields across two transdiagnostic cohorts*.
 
