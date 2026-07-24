@@ -4,44 +4,22 @@ library(flextable)
 library(tibble)
 library(officer)
 
-# demo_config <- list(
-#   cohort = "LA5c",
-#   demo_path = "data/demo.csv",
-#   dx_path = "data/wide_diagnoses.csv",
-#   output_path = "out/Table1_Cohort_Characteristics.docx",
-#
-#   id_col = "participant_id",
-#   age_col = "age",
-#
-#   sex_col = "gender",
-#   sex_map = c("1" = "Male", "2" = "Female"),
-#
-#   nodiag_col = "NODIAG",
-#
-#   group_source = "id"
-# )
+cohort_name <- sub("_2$", "", basename(normalizePath(getwd())))
+if (!cohort_name %in% c("LA5c", "TCP")) {
+  stop("Run this script from the LA5c or TCP project root.")
+}
 
 demo_config <- list(
-  cohort = "TCP",
+  cohort = cohort_name,
   demo_path = "data/demo.csv",
   dx_path = "data/wide_diagnoses.csv",
   output_path = "out/Table1_Cohort_Characteristics.docx",
-  
+
   id_col = "participant_id",
   age_col = "age",
-  
-  sex_col = "sex",
-  sex_map = c("M" = "Male", "F" = "Female", "Male" = "Male", "Female" = "Female"),
-  
+  sex_col = "gender",
   nodiag_col = "NODIAG",
-  ndiagnoses_col = "NDIAGNOSES",
-  
-  group_source = "column",
-  group_col = "group",
-  group_map = c(
-    "GenPop" = "General population",
-    "Patient" = "Clinical group"
-  )
+  group_col = "group"
 )
 
 clean_id <- function(x) trimws(as.character(x))
@@ -58,15 +36,35 @@ normalise_binary <- function(x) {
   )
 }
 
-standardise_from_map <- function(x, map) {
-  x_chr <- clean_id(x)
-  out <- unname(map[x_chr])
-  if_else(is.na(out), x_chr, out)
+standardise_sex <- function(x) {
+  x <- str_to_lower(clean_id(x))
+  case_when(
+    x %in% c("1", "m", "male") ~ "Male",
+    x %in% c("2", "f", "female") ~ "Female",
+    x %in% c("o", "other") ~ "Other",
+    TRUE ~ NA_character_
+  )
 }
 
 derive_group_from_id <- function(ids) {
   factor(
     if_else(str_detect(clean_id(ids), "^sub-1"), "General population", "Clinical group"),
+    levels = c("General population", "Clinical group")
+  )
+}
+
+standardise_group <- function(data, config) {
+  if (!config$group_col %in% names(data)) {
+    return(derive_group_from_id(data[[config$id_col]]))
+  }
+
+  x <- str_to_lower(clean_id(data[[config$group_col]]))
+  factor(
+    case_when(
+      x %in% c("genpop", "general population") ~ "General population",
+      x %in% c("patient", "clinical group") ~ "Clinical group",
+      TRUE ~ NA_character_
+    ),
     levels = c("General population", "Clinical group")
   )
 }
@@ -92,36 +90,19 @@ read_delim_clean <- function(path, id_col) {
 }
 
 derive_clinical_status <- function(data, demo_config) {
-  if (demo_config$cohort == "TCP") {
-    if (!demo_config$ndiagnoses_col %in% names(data)) {
-      stop("Missing TCP diagnoses-count column: ", demo_config$ndiagnoses_col)
-    }
-    
-    ndiag <- suppressWarnings(as.numeric(data[[demo_config$ndiagnoses_col]]))
-    
-    factor(
-      case_when(
-        is.na(ndiag) ~ NA_character_,
-        ndiag == 0 ~ "No diagnosis",
-        ndiag > 0 ~ "Any diagnosis",
-        TRUE ~ NA_character_
-      ),
-      levels = c("No diagnosis", "Any diagnosis")
-    )
-  } else {
-    if (!demo_config$nodiag_col %in% names(data)) {
-      stop("Missing LA5c no-diagnosis column: ", demo_config$nodiag_col)
-    }
-    
-    factor(
-      case_when(
-        normalise_binary(data[[demo_config$nodiag_col]]) == 1L ~ "No diagnosis",
-        normalise_binary(data[[demo_config$nodiag_col]]) == 0L ~ "Any diagnosis",
-        TRUE ~ NA_character_
-      ),
-      levels = c("No diagnosis", "Any diagnosis")
-    )
+  if (!demo_config$nodiag_col %in% names(data)) {
+    stop("Missing no-diagnosis column: ", demo_config$nodiag_col)
   }
+
+  nodiag <- normalise_binary(data[[demo_config$nodiag_col]])
+  factor(
+    case_when(
+      nodiag == 1L ~ "No diagnosis",
+      nodiag == 0L ~ "Any diagnosis",
+      TRUE ~ NA_character_
+    ),
+    levels = c("No diagnosis", "Any diagnosis")
+  )
 }
 
 demo_raw <- read_delim_clean(demo_config$demo_path, demo_config$id_col)
@@ -157,18 +138,11 @@ df <- u_df %>%
   mutate(
     age_std = suppressWarnings(as.numeric(.data[[demo_config$age_col]])),
     sex_std = factor(
-      standardise_from_map(.data[[demo_config$sex_col]], demo_config$sex_map),
-      levels = c("Male", "Female")
+      standardise_sex(.data[[demo_config$sex_col]]),
+      levels = c("Male", "Female", "Other")
     ),
-    group_std = if (demo_config$group_source == "column") {
-      factor(
-        standardise_from_map(.data[[demo_config$group_col]], demo_config$group_map),
-        levels = c("General population", "Clinical group")
-      )
-    } else {
-      derive_group_from_id(.data[[demo_config$id_col]])
-    },
-    clinical_status = derive_clinical_status(cur_data(), demo_config)
+    group_std = standardise_group(pick(everything()), demo_config),
+    clinical_status = derive_clinical_status(pick(everything()), demo_config)
   )
 
 if (nrow(df) == 0) {
@@ -206,6 +180,14 @@ table_df <- bind_rows(
     indent = 1L,
     section = FALSE
   ),
+  if (any(df$sex_std == "Other", na.rm = TRUE)) {
+    tibble(
+      Characteristic = "Other",
+      Value = fmt_npct(df$sex_std == "Other", digits = 0),
+      indent = 1L,
+      section = FALSE
+    )
+  },
   tibble(
     Characteristic = "Recruitment group",
     Value = "",

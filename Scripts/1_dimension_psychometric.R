@@ -143,7 +143,9 @@ constant_profile_value <- function(Xdf) {
   same <- rep(TRUE, n)
   if (ncol(Xdf) > 1L) {
     for (j in 2:ncol(Xdf)) {
-      same <- same & (as.character(Xdf[[j]]) == ref)
+      equal_j <- as.character(Xdf[[j]]) == ref
+      equal_j[is.na(equal_j)] <- FALSE
+      same <- same & equal_j
     }
   }
   
@@ -177,7 +179,9 @@ prep_X_for_gower <- function(X,
     if (!is.factor(f) || is.ordered(f)) return(f)
     tb <- prop.table(table(f))
     keep <- names(tb)[tb >= prop]
-    f <- factor(ifelse(f %in% keep, as.character(f), NA), exclude = NULL)
+    out <- as.character(f)
+    out[!is.na(out) & !out %in% keep] <- NA_character_
+    f <- factor(out, levels = keep, exclude = NA)
     droplevels(f)
   }
   X1 <- as.data.frame(lapply(X1, drop_rare, prop = rare_prop), stringsAsFactors = FALSE)
@@ -1093,57 +1097,132 @@ survivors_from_weights <- function(w,
 
 # --- PCA and Residuals Helpers ---
 
-design_with_map <- function(X) {
+design_with_map <- function(X, nominal_missing = PCA_NOMINAL_MISSING) {
   Xg <- as.data.frame(X, check.names = TRUE, stringsAsFactors = FALSE)
   if (!ncol(Xg)) stop("[design_with_map] input has 0 columns")
-  
-  # Filter constant cols
+
   keep <- vapply(Xg, function(v) length(unique(na.omit(v))) >= 2L, logical(1))
-  if (!any(keep)) stop("[design_with_map] all columns are NA-only")
+  if (!any(keep)) stop("[design_with_map] all columns are NA-only or constant")
   Xg <- Xg[, keep, drop = FALSE]
-  
-  # Type standardization for modeling
-  for (nm in names(Xg)) {
-    v <- Xg[[nm]]
-    if (is.ordered(v)) {
-      if (isTRUE(TREAT_ORDINALS_AS_NOMINAL)) {
-        Xg[[nm]] <- factor(v, levels = levels(v), ordered = FALSE, exclude = NULL)
-      } else {
-        Xg[[nm]] <- as.numeric(v)
+
+  nominal_missing <- match.arg(tolower(nominal_missing), c("mode", "level"))
+  imputation_rows <- list()
+  blocks <- vector("list", ncol(Xg))
+  block_varmap <- vector("list", ncol(Xg))
+  block_levelmap <- vector("list", ncol(Xg))
+
+  for (j in seq_along(Xg)) {
+    nm <- names(Xg)[j]
+    v <- Xg[[j]]
+
+    if (is.ordered(v) && isTRUE(TREAT_ORDINALS_AS_NOMINAL)) {
+      v <- factor(as.character(v), levels = levels(v), ordered = FALSE, exclude = NA)
+    } else if (is.ordered(v)) {
+      v <- as.numeric(v)
+    } else if (is.logical(v)) {
+      v <- factor(v, levels = c(FALSE, TRUE), ordered = FALSE, exclude = NA)
+    } else if (!is.factor(v) && !is.numeric(v) && !is.integer(v)) {
+      v <- factor(as.character(v), ordered = FALSE, exclude = NA)
+    }
+
+    if (is.factor(v)) {
+      counts <- table(v, useNA = "no")
+      min_level_count <- max(
+        as.integer(GOWER_SUBSET_MIN_LEVEL_N),
+        ceiling(RARE_LEVEL_MIN_PROP * nrow(Xg))
+      )
+      rare_levels <- names(counts)[counts < min_level_count]
+      if (length(rare_levels)) {
+        values <- as.character(v)
+        values[!is.na(values) & values %in% rare_levels] <- NA_character_
+        v <- factor(
+          values,
+          levels = setdiff(levels(v), rare_levels),
+          ordered = FALSE,
+          exclude = NA
+        )
       }
-      next
+      n_missing <- sum(is.na(v))
+      if (n_missing && nominal_missing == "mode") {
+        counts <- table(v, useNA = "no")
+        if (!length(counts)) stop("[design_with_map] no observed level for ", nm)
+        fill <- names(counts)[which.max(counts)]
+        values <- as.character(v)
+        values[is.na(values)] <- fill
+        v <- factor(values, levels = levels(v), ordered = FALSE, exclude = NA)
+      } else if (n_missing && nominal_missing == "level") {
+        values <- as.character(v)
+        values[is.na(values)] <- "(Missing)"
+        v <- factor(values, levels = c(levels(v), "(Missing)"), ordered = FALSE)
+        fill <- "(Missing)"
+      } else {
+        fill <- NA_character_
+      }
+
+      lev <- levels(droplevels(v))
+      if (length(lev) < 2L) next
+      block <- vapply(lev, function(level) as.numeric(v == level), numeric(nrow(Xg)))
+      if (is.null(dim(block))) block <- matrix(block, ncol = 1L)
+      colnames(block) <- paste0(nm, "__level__", make.names(lev, unique = TRUE))
+      blocks[[j]] <- block
+      block_varmap[[j]] <- rep(nm, length(lev))
+      block_levelmap[[j]] <- lev
+      if (n_missing) {
+        imputation_rows[[length(imputation_rows) + 1L]] <- data.frame(
+          source_var = nm,
+          n_missing = n_missing,
+          method = nominal_missing,
+          fill_value = fill,
+          stringsAsFactors = FALSE
+        )
+      }
+    } else {
+      v <- as.numeric(v)
+      n_missing <- sum(is.na(v))
+      fill <- NA_real_
+      if (n_missing) {
+        fill <- stats::median(v, na.rm = TRUE)
+        if (!is.finite(fill)) stop("[design_with_map] cannot impute numeric column ", nm)
+        v[is.na(v)] <- fill
+        imputation_rows[[length(imputation_rows) + 1L]] <- data.frame(
+          source_var = nm,
+          n_missing = n_missing,
+          method = "median",
+          fill_value = as.character(fill),
+          stringsAsFactors = FALSE
+        )
+      }
+      blocks[[j]] <- matrix(v, ncol = 1L, dimnames = list(NULL, nm))
+      block_varmap[[j]] <- nm
+      block_levelmap[[j]] <- NA_character_
     }
-    if (is.numeric(v) || is.integer(v)) next
-    if (is.logical(v)) {
-      Xg[[nm]] <- factor(v, levels = c(FALSE, TRUE))
-      next
-    }
-    if (is.factor(v)) next
-    if (is.matrix(v)) {
-      Xg[[nm]] <- as.numeric(v)
-      next
-    }
-    Xg[[nm]] <- factor(as.character(v))
   }
-  
-  fml <- as.formula(paste("~", paste(colnames(Xg), collapse = " + "), "-1"))
-  tm <- terms(fml, data = Xg)
-  MM <- model.matrix(tm, data = Xg)
+
+  nonempty <- lengths(blocks) > 0L
+  if (!any(nonempty)) stop("[design_with_map] no encodable columns remain")
+  MM <- do.call(cbind, blocks[nonempty])
   storage.mode(MM) <- "double"
-  
-  # Filter zero variance in design matrix
+  rownames(MM) <- rownames(Xg)
+  varmap <- unlist(block_varmap[nonempty], use.names = FALSE)
+  levelmap <- unlist(block_levelmap[nonempty], use.names = FALSE)
+
   ok <- apply(MM, 2L, function(col) {
-    v <- stats::var(as.numeric(col), na.rm = TRUE)
-    is.finite(v) && v > 1e-12
+    vv <- stats::var(as.numeric(col), na.rm = TRUE)
+    is.finite(vv) && vv > 1e-12
   })
-  
   if (!any(ok)) stop("[design_with_map] all encoded columns were ~zero-variance")
-  
-  assign <- attr(MM, "assign")
-  tl <- attr(tm, "term.labels")
-  varmap <- tl[assign]
+
   MM <- MM[, ok, drop = FALSE]
   attr(MM, "varmap") <- varmap[ok]
+  attr(MM, "levelmap") <- levelmap[ok]
+  attr(MM, "imputation") <- if (length(imputation_rows)) {
+    do.call(rbind, imputation_rows)
+  } else {
+    data.frame(
+      source_var = character(), n_missing = integer(), method = character(),
+      fill_value = character(), stringsAsFactors = FALSE
+    )
+  }
   MM
 }
 
@@ -1351,13 +1430,92 @@ cols_to_drop <- grep(drop_pattern, names(df), value = TRUE)
 X <- dplyr::select(df, -dplyr::all_of(c(id_col, cols_to_drop))) |>
   as.data.frame(stringsAsFactors = FALSE)
 
-# Robust type coercion
+# Apply explicit item metadata before heuristic type coercion. The psychometric
+# CSV stores response codes as numbers, so R cannot otherwise distinguish an
+# ordinal response scale from a genuinely continuous variable.
+resolve_schema_path <- function(path, psych_csv) {
+  if (is.null(path) || !nzchar(path)) return("")
+  if (file.exists(path)) return(normalizePath(path, mustWork = TRUE))
+  candidate <- file.path(dirname(psych_csv), basename(path))
+  if (file.exists(candidate)) return(normalizePath(candidate, mustWork = TRUE))
+  path
+}
+
+parse_schema_levels <- function(text) {
+  if (is.na(text) || !nzchar(trimws(text))) return(numeric())
+  values <- suppressWarnings(as.numeric(strsplit(text, "|", fixed = TRUE)[[1L]]))
+  values[is.finite(values)]
+}
+
+schema_path <- resolve_schema_path(ITEM_RESPONSE_SCHEMA_CSV, PSY_CSV)
+response_code_audit <- NULL
+if (nzchar(schema_path) && file.exists(schema_path)) {
+  response_schema <- read_input_table(schema_path, col_types = readr::cols(.default = readr::col_character()))
+  required_schema_cols <- c("var", "kind", "valid_levels")
+  missing_schema_cols <- setdiff(required_schema_cols, names(response_schema))
+  if (length(missing_schema_cols)) {
+    stop("[schema] Missing required columns: ", paste(missing_schema_cols, collapse = ", "))
+  }
+  if (anyDuplicated(response_schema$var)) stop("[schema] Duplicate variable names")
+  missing_schema_vars <- setdiff(names(X), response_schema$var)
+  if (length(missing_schema_vars) && isTRUE(REQUIRE_ITEM_RESPONSE_SCHEMA)) {
+    stop("[schema] Variables absent from item_response_schema.csv: ",
+         paste(head(missing_schema_vars, 20L), collapse = ", "))
+  }
+
+  audit_rows <- list()
+  for (nm in intersect(names(X), response_schema$var)) {
+    row <- response_schema[match(nm, response_schema$var), , drop = FALSE]
+    kind <- tolower(trimws(row$kind[[1L]]))
+    if (identical(kind, "nominal")) {
+      valid <- parse_schema_levels(row$valid_levels[[1L]])
+      if (length(valid) < 2L) stop("[schema] Fewer than two valid levels for ", nm)
+      values <- suppressWarnings(as.numeric(X[[nm]]))
+      invalid <- is.finite(values) & !values %in% valid
+      invalid_values <- sort(unique(values[invalid]))
+      if (any(invalid) && !identical(tolower(INVALID_RESPONSE_ACTION), "missing")) {
+        stop("[schema] Invalid response code(s) in ", nm, ": ",
+             paste(sort(unique(values[invalid])), collapse = ", "))
+      }
+      values[invalid] <- NA_real_
+      X[[nm]] <- factor(values, levels = valid, ordered = FALSE, exclude = NA)
+      audit_rows[[length(audit_rows) + 1L]] <- data.frame(
+        var = nm,
+        kind = kind,
+        n_invalid_to_missing = sum(invalid),
+        invalid_codes = paste(invalid_values, collapse = "|"),
+        stringsAsFactors = FALSE
+      )
+    } else if (identical(kind, "continuous")) {
+      X[[nm]] <- suppressWarnings(as.numeric(X[[nm]]))
+      audit_rows[[length(audit_rows) + 1L]] <- data.frame(
+        var = nm, kind = kind, n_invalid_to_missing = 0L,
+        invalid_codes = "", stringsAsFactors = FALSE
+      )
+    } else {
+      stop("[schema] Unknown kind for ", nm, ": ", kind)
+    }
+  }
+  response_code_audit <- dplyr::bind_rows(audit_rows)
+  cat(sprintf(
+    "[schema] Applied %d item definitions (%d nominal, %d continuous); %d invalid code(s) set to missing.\n",
+    nrow(response_code_audit),
+    sum(response_code_audit$kind == "nominal"),
+    sum(response_code_audit$kind == "continuous"),
+    sum(response_code_audit$n_invalid_to_missing)
+  ))
+} else if (isTRUE(REQUIRE_ITEM_RESPONSE_SCHEMA)) {
+  stop("[schema] Required item response schema not found: ", schema_path)
+}
+
+# Heuristic fallback for matrices without an explicit schema.
 is_small_int_scale <- function(v) {
   vn <- suppressWarnings(as.numeric(v))
   if (all(is.na(vn))) return(FALSE)
   u <- sort(unique(na.omit(vn)))
   k <- length(u)
-  k >= 3 && k <= 7 && all(abs(u - round(u)) < 1e-8)
+  k >= 3 && k <= as.integer(SMALL_INT_NOMINAL_MAX_UNIQUE) &&
+    all(abs(u - round(u)) < 1e-8)
 }
 parse_numeric_text <- function(v) {
   ch <- trimws(as.character(v))
@@ -1387,6 +1545,7 @@ numeric_01_predictors <- character(0)
 
 for (nm in names(X)) {
   v <- X[[nm]]
+  if (is.factor(v)) next
   if (is.character(v)) {
     vn <- parse_numeric_text(v)
     if (!is.null(vn)) v <- vn
@@ -1500,6 +1659,9 @@ predictor_missingness <- predictor_missingness[order(
 if (isTRUE(REPORT_PREDICTOR_MISSINGNESS)) {
   write_csv(predictor_missingness, "predictor_missingness.csv")
 }
+if (!is.null(response_code_audit)) {
+  write_csv(response_code_audit, "response_code_audit.csv")
+}
 
 max_missing_prop <- MAX_PREDICTOR_MISSING_PROP
 high_missing_predictors <- predictor_missingness$var[
@@ -1529,21 +1691,78 @@ prop_obs_row <- rowMeans(!is.na(X))
 cat("[debug] resumo proporção de itens observados por linha:\n")
 print(summary(prop_obs_row))
 
-keep <- stats::complete.cases(X) & !is.na(ids_all) & ids_all != ""
+row_missingness <- data.frame(
+  participant_id = ids_all,
+  n_missing = rowSums(is.na(X)),
+  prop_missing = rowMeans(is.na(X)),
+  stringsAsFactors = FALSE
+)
+write_csv(row_missingness, "participant_predictor_missingness.csv")
+
+keep <- row_missingness$prop_missing <= MAX_PARTICIPANT_MISSING_PROP &
+  !is.na(ids_all) & ids_all != ""
 X <- X[keep, , drop = FALSE]
 ids_all <- ids_all[keep]
 
 if (nrow(X) == 0L) {
   stop(sprintf(
-    "[ingest] Depois de complete.cases, X ficou com 0 linhas (PSY_CSV=%s).\n"+
-      "Isto significa que para este merge longitudinal não há uma única linha sem NA em X.\n"+
-      "Tens provavelmente colunas só-NA para algumas waves, ou nenhum sujeito completamente observado.",
+    "[ingest] No rows remained after applying MAX_PARTICIPANT_MISSING_PROP=%.3f (PSY_CSV=%s).",
+    MAX_PARTICIPANT_MISSING_PROP,
     PSY_CSV
   ))
 }
+cat(sprintf(
+  "[ingest] Retained %d/%d participants with predictor missingness <= %.1f%%; Gower uses pairwise available variables and PCA applies the configured deterministic imputation.\n",
+  nrow(X), length(keep), 100 * MAX_PARTICIPANT_MISSING_PROP
+))
 
 rownames(X) <- make.unique(ids_all)
 colnames(X) <- make.names(colnames(X), unique = TRUE)
+
+if (isTRUE(VALIDATE_ENCODING_ONLY)) {
+  nominal_names <- names(X)[vapply(X, function(v) is.factor(v) && !is.ordered(v), logical(1))]
+  PX_check <- prep_X_for_gower(
+    X, rare_prop = RARE_LEVEL_MIN_PROP, do_jitter = FALSE, seed = SEED_JITTER
+  )
+  incorrectly_binned <- intersect(nominal_names, PX_check$binned_continuous_cols)
+  if (length(incorrectly_binned)) {
+    stop("[validate] Nominal variables entered the continuous-binning branch: ",
+         paste(head(incorrectly_binned, 20L), collapse = ", "))
+  }
+  if (any(vapply(PX_check$X[nominal_names], is.ordered, logical(1)))) {
+    stop("[validate] At least one nominal variable remained ordered in the Gower input")
+  }
+
+  Xenc_check <- design_with_map(X, nominal_missing = PCA_NOMINAL_MISSING)
+  varmap_check <- attr(Xenc_check, "varmap")
+  levelmap_check <- attr(Xenc_check, "levelmap")
+  encoded_counts_check <- table(varmap_check)
+  if (any(encoded_counts_check[nominal_names] < 2L, na.rm = TRUE)) {
+    stop("[validate] At least one nominal variable lacks response-level dummy columns")
+  }
+  if (any(is.na(levelmap_check[varmap_check %in% nominal_names]))) {
+    stop("[validate] Missing response-level labels in nominal encoding")
+  }
+
+  validation_summary <- data.frame(
+    n_participants = nrow(X),
+    n_source_variables = ncol(X),
+    n_nominal_variables = length(nominal_names),
+    n_continuous_variables = ncol(X) - length(nominal_names),
+    n_encoded_columns = ncol(Xenc_check),
+    n_gower_binned_continuous = length(PX_check$binned_continuous_cols),
+    n_invalid_codes_to_missing = if (is.null(response_code_audit)) 0L else
+      sum(response_code_audit$n_invalid_to_missing),
+    stringsAsFactors = FALSE
+  )
+  write_csv(validation_summary, "encoding_validation_summary.csv")
+  cat("[validate] Nominal preprocessing and response-level encoding passed.\n")
+  signalCondition(structure(
+    list(message = "encoding validation complete"),
+    class = c("encoding_validation_complete", "condition")
+  ))
+  stop("[validate] encoding_validation_complete condition was not handled")
+}
 
 degenerate_value <- constant_profile_value(X)
 degenerate_mask <- !is.na(degenerate_value)
@@ -2354,9 +2573,15 @@ if (length(diag_idx) >= 3L) {
 # ==============================================================================
 
 # Encode
-Xenc <- design_with_map(X)
+Xenc <- design_with_map(X, nominal_missing = PCA_NOMINAL_MISSING)
 varmap_full <- attr(Xenc, "varmap")
 names(varmap_full) <- colnames(Xenc)
+levelmap_full <- attr(Xenc, "levelmap")
+names(levelmap_full) <- colnames(Xenc)
+encoding_imputation <- attr(Xenc, "imputation")
+if (!is.null(encoding_imputation) && nrow(encoding_imputation)) {
+  write_csv(encoding_imputation, "encoding_imputation.csv")
+}
 
 # Standardise + drop degenerate encoded cols
 Z0 <- scale(Xenc, center = TRUE, scale = TRUE)
@@ -2370,6 +2595,18 @@ if (!ncol(Z0)) {
 
 # Map for surviving encoded columns
 varmap <- varmap_full[colnames(Z0)]
+levelmap <- levelmap_full[colnames(Z0)]
+nominal_vars_encoded <- intersect(names(X)[vapply(X, is.factor, logical(1))], unique(varmap))
+encoded_counts <- table(varmap)
+bad_nominal_encoding <- nominal_vars_encoded[encoded_counts[nominal_vars_encoded] < 2L]
+if (length(bad_nominal_encoding)) {
+  stop("[PCA] Nominal variables were not expanded to at least two response-level columns: ",
+       paste(head(bad_nominal_encoding, 20L), collapse = ", "))
+}
+cat(sprintf(
+  "[PCA] Encoded %d source variables as %d columns; nominal sources contribute one column per observed response level.\n",
+  length(unique(varmap)), ncol(Z0)
+))
 
 # Allocate weights AFTER filtering so per-item totals are preserved
 w_enc <- setNames(numeric(ncol(Z0)), colnames(Z0))
@@ -2543,6 +2780,7 @@ choose_k_nb <- function(e, nb_list, folds = CV_FOLDS, seed = SEED_GLOBAL, key = 
 RESIDUAL_PERM_B <- N_PERM
 MIN_SD_ITEM <- 1e-6
 
+if (isTRUE(RUN_ITEM_DIAGNOSTICS)) {
 cat(sprintf("[Item Roles] Starting diagnostics on %d items...\n", length(vars_diag)))
 
 roles_rows <- lapply(vars_diag, function(nm) {
@@ -2589,6 +2827,9 @@ if (nrow(roles_df) > 0) {
   cat(sprintf("[roles] wrote: %s  (p=%d items processed)\n", "predictive_item_roles_diagnostics.csv", nrow(roles_df)))
 } else {
   warning("[roles] No valid items found for roles analysis.")
+}
+} else {
+  message("[roles] Diagnostic-only parent-item PC1 summaries skipped (RUN_ITEM_DIAGNOSTICS=FALSE).")
 }
 
 # ==============================================================================
@@ -2772,7 +3013,7 @@ saveRDS(list(
   ID_Bprime = c(all = ID_B_all, core = ID_B_core, LB = ID_B_LB),
   ID_Fprime = c(all = ID_Fp_all, core = ID_Fp_core, LB = ID_Fp_LB),
   clusters = clF
-), file = "residual_only_summary.rds")
+), file = file.path(OUTPUTS_DIR, "residual_only_summary.rds"))
 
 cat("[Resid-only] wrote:", file.path(OUTPUTS_DIR, "residual_only_summary.rds"), "\n")
 } else {
@@ -2868,7 +3109,8 @@ if (DX_AVAILABLE) {
   cat(sprintf("[base-field] wrote %d grid(s) to %s\n", length(dx_surface_files), paste0(OUTPUTS_DIR, "/base_prob_grids/")))
   
   # --- Item x Diagnosis Interactions (Parallelized OOF GAM) ---
-  
+
+  if (isTRUE(RUN_ITEM_DIAGNOSTICS)) {
   vars_item_interact <- unique(varmap)
   n_probe_count <- if (exists("N_TOP_PER_DX")) N_TOP_PER_DX else 50
   vars_probe <- head(vars_item_interact, min(n_probe_count, length(vars_item_interact)))
@@ -3019,6 +3261,9 @@ if (DX_AVAILABLE) {
     }
   } else {
     warning("[interactions] No valid interactions computed.")
+  }
+  } else {
+    message("[interactions] Diagnostic-only parent-item PC1 interactions skipped (RUN_ITEM_DIAGNOSTICS=FALSE).")
   }
 } else {
   message("[dx] Section 8 (predictive diagnostics & interactions) disabled: DX set as optional (setup.R)")
@@ -3552,7 +3797,7 @@ saveRDS(list(
   participant_id = ids_for_mats,
   XR = XR_use,
   Fprime = Fprime_use
-), file = "Fprime_matrix.rds")
+), file = file.path(OUTPUTS_DIR, "Fprime_matrix.rds"))
 
 nrow_or_na <- function(x) if (is.null(x)) "NA" else as.character(nrow(x))
 message(sprintf("[export] embedding_base_b1b2.csv rows=%d; residual_export=%s; XR rows=%s; Fprime rows=%s",
@@ -3573,30 +3818,25 @@ write_csv(w_tbl, "gower_weights_optimised.csv")
 enc_map <- data.frame(
   mm_col = colnames(Xenc_w),
   source_var = as.character(varmap),
+  response_level = as.character(levelmap),
   weight_share = as.numeric(w_enc[colnames(Xenc_w)]),
   stringsAsFactors = FALSE
 )
 write_csv(enc_map, "encoding_map_and_weight_share.csv")
 
 # Session Info
-zz <- file("sessionInfo.txt", open = "wt")
-sink(zz)
-on.exit(
-  {
-    sink()
-    close(zz)
-  },
-  add = TRUE
-)
-print(sessionInfo())
-cat("\n\nSetup snapshot:\n")
 setup_snapshot <- list(
   outputs_dir = OUTPUTS_DIR,
   base_dim = BASE_DIM,
   base_decomp_method = BASE_DECOMP_METHOD,
   weighting_mode = WEIGHTING_MODE,
   treat_ordinals_as_nominal = TREAT_ORDINALS_AS_NOMINAL,
+  item_response_schema_csv = schema_path,
+  invalid_response_action = INVALID_RESPONSE_ACTION,
+  max_participant_missing_prop = MAX_PARTICIPANT_MISSING_PROP,
+  pca_nominal_missing = PCA_NOMINAL_MISSING,
   missing_as_nominal_level = MISSING_AS_NOMINAL_LEVEL,
+  run_item_diagnostics = RUN_ITEM_DIAGNOSTICS,
   n_rows_sub = N_ROWS_SUB,
   final_diag_mode = FINAL_DIAG_MODE,
   diag_n_max = DIAG_N_MAX,
@@ -3609,7 +3849,14 @@ setup_snapshot <- list(
   palette_engine = PALETTE_ENGINE,
   palette_name = PALETTE_NAME
 )
-print(str(setup_snapshot, max.level = 1))
+capture.output(
+  {
+    print(sessionInfo())
+    cat("\n\nSetup snapshot:\n")
+    str(setup_snapshot, max.level = 1)
+  },
+  file = "sessionInfo.txt"
+)
 
 cat("[export] wrote embeddings, enrichment tables, weights, and session info.\n")
 
@@ -3646,7 +3893,7 @@ density_plots <- function(geom) {
     theme_pub(12)
 }
 
-density_plots_base <- function(Base_A, cover = 1, pad_frac = 0.06) {
+density_plots_base <- function(Base_A, cover = 1, pad_frac = 0.10) {
   dfB <- data.frame(
     b1 = as.numeric(Base_A[, 1]),
     b2 = as.numeric(Base_A[, 2]),
@@ -3675,12 +3922,14 @@ density_plots_base <- function(Base_A, cover = 1, pad_frac = 0.06) {
       data = dfB, ggplot2::aes(b1, b2),
       shape = 16, size = 0.9, colour = scales::alpha("black", 0.35)
     ) +
-    ggplot2::coord_equal(xlim = xlim, ylim = ylim, expand = FALSE) +
+    ggplot2::scale_x_continuous(limits = xlim, expand = ggplot2::expansion(mult = 0)) +
+    ggplot2::scale_y_continuous(limits = ylim, expand = ggplot2::expansion(mult = 0)) +
+    ggplot2::coord_equal(expand = FALSE) +
     ggplot2::labs(x = "b1", y = "b2") +
     theme_pub(12)
 }
 
-density_plots_base_pair <- function(Base, i = 1L, j = 2L, name = NULL, pad_frac = 0.06) {
+density_plots_base_pair <- function(Base, i = 1L, j = 2L, name = NULL, pad_frac = 0.10) {
   stopifnot(ncol(Base) >= max(i, j))
   dfB <- data.frame(
     x = as.numeric(Base[, i]),
@@ -3712,7 +3961,9 @@ density_plots_base_pair <- function(Base, i = 1L, j = 2L, name = NULL, pad_frac 
       shape = 16, size = 0.9,
       colour = scales::alpha("black", 0.35)
     ) +
-    ggplot2::coord_equal(xlim = xlim, ylim = ylim, expand = FALSE) +
+    ggplot2::scale_x_continuous(limits = xlim, expand = ggplot2::expansion(mult = 0)) +
+    ggplot2::scale_y_continuous(limits = ylim, expand = ggplot2::expansion(mult = 0)) +
+    ggplot2::coord_equal(expand = FALSE) +
     ggplot2::labs(
       x = paste0("b", i),
       y = paste0("b", j),
@@ -3888,7 +4139,12 @@ direction_wheel_plot <- function(geom) {
     theme_pub(12)
 }
 
-direction_wheel_plot_base <- function(Base_A, cover = 1, pad_frac = 0.06) {
+direction_wheel_plot_base <- function(Base_A,
+                                      cover = 1,
+                                      pad_frac = 0.18,
+                                      bandwidth_mult = 1.20,
+                                      alpha_power = 0.58,
+                                      edge_fade_frac = 0.10) {
   dfB <- data.frame(
     b1 = as.numeric(Base_A[, 1]),
     b2 = as.numeric(Base_A[, 2]),
@@ -3915,12 +4171,14 @@ direction_wheel_plot_base <- function(Base_A, cover = 1, pad_frac = 0.06) {
     ry[1] - pad_frac * wy, ry[2] + pad_frac * wy
   )
   
-  kd <- with(dfB, MASS::kde2d(b1, b2, n = nu, lims = lims))
+  h <- c(MASS::bandwidth.nrd(dfB$b1), MASS::bandwidth.nrd(dfB$b2)) *
+    bandwidth_mult
+  kd <- with(dfB, MASS::kde2d(b1, b2, n = nu, lims = lims, h = h))
   D <- kd$z
   D <- log1p(D / max(D, na.rm = TRUE))
   D <- D / stats::quantile(D, 0.99, na.rm = TRUE)
   D[D > 1] <- 1; D[D < 0] <- 0
-  ALPHA <- D^0.70
+  ALPHA <- D^alpha_power
   
   gx <- kd$x
   gy <- kd$y
@@ -3937,6 +4195,15 @@ direction_wheel_plot_base <- function(Base_A, cover = 1, pad_frac = 0.06) {
   
   G$fill <- grDevices::hcl(H, C, L)
   G$alpha <- as.vector(ALPHA)
+
+  edge_fade <- function(x, lo, hi, frac) {
+    width <- max((hi - lo) * frac, .Machine$double.eps)
+    z <- pmin(pmax(pmin(x - lo, hi - x) / width, 0), 1)
+    sin(z * pi / 2)^2
+  }
+  G$alpha <- G$alpha *
+    edge_fade(G$b1, lims[1], lims[2], edge_fade_frac) *
+    edge_fade(G$b2, lims[3], lims[4], edge_fade_frac)
   
   ggplot2::ggplot() +
     ggplot2::geom_raster(
@@ -4080,7 +4347,10 @@ direction_wheel_plot_labeled <- function(geom,
 
 direction_wheel_plot_base_labeled <- function(Base_A,
                                               cover = 1,
-                                              pad_frac = 0.06,
+                                              pad_frac = 0.18,
+                                              bandwidth_mult = 1.20,
+                                              alpha_power = 0.58,
+                                              edge_fade_frac = 0.10,
                                               label_size = 0.75,
                                               label_alpha = 0.5,
                                               repel = TRUE) {
@@ -4111,12 +4381,14 @@ direction_wheel_plot_base_labeled <- function(Base_A,
     ry[1] - pad_frac * wy, ry[2] + pad_frac * wy
   )
   
-  kd <- with(dfB, MASS::kde2d(b1, b2, n = nu, lims = lims))
+  h <- c(MASS::bandwidth.nrd(dfB$b1), MASS::bandwidth.nrd(dfB$b2)) *
+    bandwidth_mult
+  kd <- with(dfB, MASS::kde2d(b1, b2, n = nu, lims = lims, h = h))
   D <- kd$z
   D <- log1p(D / max(D, na.rm = TRUE))
   D <- D / stats::quantile(D, 0.99, na.rm = TRUE)
   D[D > 1] <- 1; D[D < 0] <- 0
-  ALPHA <- D^0.70
+  ALPHA <- D^alpha_power
   
   gx <- kd$x; gy <- kd$y
   G <- expand.grid(b1 = gx, b2 = gy)
@@ -4132,6 +4404,15 @@ direction_wheel_plot_base_labeled <- function(Base_A,
   
   G$fill <- grDevices::hcl(H, C, L)
   G$alpha <- as.vector(ALPHA)
+
+  edge_fade <- function(x, lo, hi, frac) {
+    width <- max((hi - lo) * frac, .Machine$double.eps)
+    z <- pmin(pmax(pmin(x - lo, hi - x) / width, 0), 1)
+    sin(z * pi / 2)^2
+  }
+  G$alpha <- G$alpha *
+    edge_fade(G$b1, lims[1], lims[2], edge_fade_frac) *
+    edge_fade(G$b2, lims[3], lims[4], edge_fade_frac)
   
   p <- ggplot2::ggplot() +
     ggplot2::geom_raster(
@@ -4392,23 +4673,27 @@ pearson_r <- function(a, b) {
   suppressWarnings(cor(as.numeric(a), as.numeric(b), use = "complete.obs", method = "pearson"))
 }
 
-build_biplot_data <- function(Z_A, varmap, Base_A, U,
-                              score_fun = score_item_1d_raw) {
+build_biplot_data <- function(Z_A, varmap, levelmap, Base_A, U) {
   B1 <- Base_A[, 1]; B2 <- Base_A[, 2]
-  items <- unique(varmap)
-  
-  Rtab <- dplyr::bind_rows(lapply(items, function(nm) {
-    v <- score_fun(nm, Z_A, varmap)
+
+  Rtab <- dplyr::bind_rows(lapply(seq_len(ncol(Z_A)), function(j) {
+    v <- as.numeric(Z_A[, j])
     if (!any(is.finite(v))) return(NULL)
-    
+
+    nm <- as.character(varmap[j])
+    response_level <- as.character(levelmap[j])
+    if (is.na(response_level) || !nzchar(response_level)) response_level <- NA_character_
     sd_item <- stats::sd(v, na.rm = TRUE)
     if (!is.finite(sd_item) || sd_item <= 0) sd_item <- 0
-    
+
     r_b1 <- pearson_r(v, B1); r_b2 <- pearson_r(v, B2)
     r_u1 <- pearson_r(v, U$u1); r_u2 <- pearson_r(v, U$u2)
-    
+
     data.frame(
       item = nm,
+      response_level = response_level,
+      encoded_col = colnames(Z_A)[j],
+      display_label = if (is.na(response_level)) nm else paste0(nm, " = ", response_level),
       r_b1 = r_b1, r_b2 = r_b2,
       r_u1 = r_u1, r_u2 = r_u2,
       sd_item = sd_item,
@@ -4442,7 +4727,7 @@ build_biplot_data <- function(Z_A, varmap, Base_A, U,
     )
 }
 
-build_biplot_data_3d <- function(Z_A, varmap, Base,
+build_biplot_data_3d <- function(Z_A, varmap, levelmap, Base,
                                  arrow = c("sd", "cov")) {
   arrow <- match.arg(arrow)
   stopifnot(ncol(Base) >= 3L)
@@ -4456,12 +4741,13 @@ build_biplot_data_3d <- function(Z_A, varmap, Base,
   sdb2 <- stats::sd(B2, na.rm = TRUE)
   sdb3 <- stats::sd(B3, na.rm = TRUE)
   
-  items <- unique(varmap)
-  
-  Rtab <- dplyr::bind_rows(lapply(items, function(nm) {
-    v <- score_item_1d_raw(nm, Z_A, varmap)
+  Rtab <- dplyr::bind_rows(lapply(seq_len(ncol(Z_A)), function(j) {
+    v <- as.numeric(Z_A[, j])
     if (!any(is.finite(v))) return(NULL)
-    
+
+    nm <- as.character(varmap[j])
+    response_level <- as.character(levelmap[j])
+    if (is.na(response_level) || !nzchar(response_level)) response_level <- NA_character_
     r1 <- pearson_r(v, B1)
     r2 <- pearson_r(v, B2)
     r3 <- pearson_r(v, B3)
@@ -4482,6 +4768,9 @@ build_biplot_data_3d <- function(Z_A, varmap, Base,
     
     data.frame(
       item = nm,
+      response_level = response_level,
+      encoded_col = colnames(Z_A)[j],
+      display_label = if (is.na(response_level)) nm else paste0(nm, " = ", response_level),
       r_b1 = r1, r_b2 = r2, r_b3 = r3,
       a_b1 = a1, a_b2 = a2, a_b3 = a3,
       sd_item = sdv,
@@ -4504,10 +4793,9 @@ build_biplot_data_3d <- function(Z_A, varmap, Base,
     )
 }
 
-plot_biplots <- function(Rtab, Base_A, U, use = c("a", "r"),
-                         top_per_octant = 4L,
+plot_biplots <- function(Rtab, Base_A, U, use = c("r", "a"),
+                         top_per_octant = 6L,
                          arrow_head_cm = 0.10) {
-  suppressPackageStartupMessages(requireNamespace("ggrepel", quietly = TRUE))
   use <- match.arg(use)
   
   has_a <- all(c("a_b1","a_b2","a_u1","a_u2","mag_a_base","mag_a_disk") %in% names(Rtab))
@@ -4541,62 +4829,178 @@ plot_biplots <- function(Rtab, Base_A, U, use = c("a", "r"),
     idx <- floor((theta_deg + 22.5 + 360) %% 360 / 45) + 1
     paste0("Octant_", idx)
   }
+
+  prepare_display_levels <- function(tab, vx_col, vy_col, mag_col) {
+    candidates <- tab |>
+      dplyr::mutate(
+        vx = .data[[vx_col]],
+        vy = .data[[vy_col]],
+        vmag = .data[[mag_col]],
+        response_numeric = suppressWarnings(as.numeric(response_level)),
+        short_item = sub("^.*\\.", "", item),
+        short_label = ifelse(
+          is.na(response_level) | !nzchar(response_level),
+          short_item,
+          paste0(short_item, " = ", response_level)
+        )
+      ) |>
+      dplyr::filter(is.finite(vx), is.finite(vy), is.finite(vmag), vmag > 0) |>
+      dplyr::group_by(item) |>
+      dplyr::mutate(n_levels = dplyr::n_distinct(response_level)) |>
+      dplyr::ungroup()
+
+    binary_levels <- candidates |>
+      dplyr::filter(n_levels == 2L) |>
+      dplyr::group_by(item) |>
+      dplyr::arrange(dplyr::desc(response_numeric),
+                     dplyr::desc(response_level), .by_group = TRUE) |>
+      dplyr::slice_head(n = 1L) |>
+      dplyr::ungroup()
+
+    multilevels <- candidates |>
+      dplyr::filter(n_levels != 2L)
+
+    dplyr::bind_rows(binary_levels, multilevels) |>
+      dplyr::mutate(octant = get_octant(vx, vy))
+  }
+
+  select_display_levels <- function(tab, vx_col, vy_col, mag_col) {
+    prepare_display_levels(tab, vx_col, vy_col, mag_col) |>
+      dplyr::group_by(octant) |>
+      dplyr::group_modify(function(.x, .y) {
+        ranked <- .x |>
+          dplyr::arrange(dplyr::desc(vmag), item, response_level) |>
+          dplyr::distinct(item, .keep_all = TRUE)
+
+        n_keep <- min(as.integer(top_per_octant), nrow(ranked))
+        n_overall <- max(0L, n_keep - 1L)
+        selected <- utils::head(ranked, n_overall) |>
+          dplyr::mutate(selection_stratum = "top_overall")
+        remaining <- ranked |>
+          dplyr::filter(!item %in% selected$item)
+
+        if (nrow(selected) && any(selected$n_levels > 2L)) {
+          extra <- utils::head(remaining, 1L) |>
+            dplyr::mutate(selection_stratum = "next_overall")
+        } else {
+          extra <- remaining |>
+            dplyr::filter(n_levels > 2L) |>
+            utils::head(1L) |>
+            dplyr::mutate(selection_stratum = "multilevel_anchor")
+          if (!nrow(extra)) {
+            extra <- utils::head(remaining, 1L) |>
+              dplyr::mutate(selection_stratum = "next_overall_no_multilevel")
+          }
+        }
+
+        dplyr::bind_rows(selected, extra) |>
+          utils::head(n_keep)
+      }) |>
+      dplyr::arrange(dplyr::desc(vmag), .by_group = TRUE) |>
+      dplyr::mutate(octant_rank = dplyr::row_number()) |>
+      dplyr::ungroup()
+  }
+
+  place_labels_on_ring <- function(tab, center_x, center_y, outer_radius) {
+    tab |>
+      dplyr::mutate(
+        octant_number = as.integer(sub("^Octant_", "", octant)),
+        octant_center = 45 * (octant_number - 1L),
+        vector_angle = atan2(vy, vx) * 180 / pi,
+        angle_from_center = ((vector_angle - octant_center + 180) %% 360) - 180
+      ) |>
+      dplyr::group_by(octant) |>
+      dplyr::arrange(angle_from_center, .by_group = TRUE) |>
+      dplyr::mutate(
+        slot_index = dplyr::row_number(),
+        slot_count = dplyr::n(),
+        slot_offset = ifelse(
+          slot_count == 1L,
+          0,
+          -18 + 36 * (slot_index - 1L) / (slot_count - 1L)
+        ),
+        label_angle = (octant_center + slot_offset) * pi / 180,
+        label_radius = outer_radius * (1 + 0.045 * ((slot_index - 1L) %% 2L)),
+        label_x = center_x + label_radius * cos(label_angle),
+        label_y = center_y + label_radius * sin(label_angle),
+        label_angle_signed = ((label_angle * 180 / pi + 180) %% 360) - 180,
+        label_text_angle = dplyr::case_when(
+          label_angle_signed > 90 ~ label_angle_signed - 180,
+          label_angle_signed < -90 ~ label_angle_signed + 180,
+          TRUE ~ label_angle_signed
+        ),
+        label_hjust = ifelse(abs(label_angle_signed) <= 90, 0, 1),
+        label_vjust = 0.5
+      ) |>
+      dplyr::ungroup()
+  }
   
-  # --- BASE ---
   # --- BASE ---
   max_mag_base <- max(Rtab[[vmag_base]], na.rm = TRUE)
   if (!is.finite(max_mag_base) || max_mag_base <= 0) max_mag_base <- 1
   Rscale_base <- Rlim / max_mag_base
-  
-  # all arrows (for length continuum)
-  S_base_all <- Rtab |>
+
+  A_base <- prepare_display_levels(Rtab, vx_b1, vx_b2, vmag_base) |>
     dplyr::mutate(
-      vx   = .data[[vx_b1]],
-      vy   = .data[[vx_b2]],
-      vmag = .data[[vmag_base]],
       x0 = cx, y0 = cy,
       x1 = cx + Rscale_base * vx,
       y1 = cy + Rscale_base * vy
     )
-  
-  # labelled subset: top per octant
-  S_base <- S_base_all |>
+  S_base <- select_display_levels(Rtab, vx_b1, vx_b2, vmag_base) |>
     dplyr::mutate(
-      octant = get_octant(vx, vy)
-    ) |>
-    dplyr::group_by(octant) |>
-    dplyr::arrange(dplyr::desc(vmag)) |>
-    dplyr::slice_head(n = as.integer(top_per_octant)) |>
-    dplyr::ungroup()
+      x0 = cx, y0 = cy,
+      x1 = cx + Rscale_base * vx,
+      y1 = cy + Rscale_base * vy
+    )
+  base_outer_radius <- 1.12 * max(
+    sqrt((B1n - cx)^2 + (B2n - cy)^2),
+    sqrt((S_base$x1 - cx)^2 + (S_base$y1 - cy)^2),
+    na.rm = TRUE
+    )
+  S_base <- place_labels_on_ring(S_base, cx, cy, base_outer_radius)
+  A_base_unlabelled <- A_base |>
+    dplyr::anti_join(
+      S_base |> dplyr::select(item, response_level),
+      by = c("item", "response_level")
+    )
   
   p_base <- ggplot2::ggplot() +
     ggplot2::geom_polygon(
       data = H, ggplot2::aes(b1, b2),
       fill = NA, colour = "black", linewidth = 0.4
     ) +
-    ggplot2::geom_segment(        # faint background for all items
-      data = S_base_all,
+    ggplot2::geom_segment(
+      data = A_base_unlabelled,
       ggplot2::aes(x = x0, y = y0, xend = x1, yend = y1),
-      linewidth = 0.4, colour = "firebrick", alpha = 0.25,
-      arrow = grid::arrow(length = grid::unit(arrow_head_cm * 0.7, "cm"),
+      linewidth = 0.18, colour = "grey35", alpha = 0.10,
+      arrow = grid::arrow(length = grid::unit(arrow_head_cm * 0.45, "cm"),
                           type = "closed")
     ) +
-    ggplot2::geom_segment(        # emphasised, labelled subset
+    ggplot2::geom_segment(
       data = S_base,
       ggplot2::aes(x = x0, y = y0, xend = x1, yend = y1),
-      linewidth = 0.9, colour = "firebrick",
+      linewidth = 0.65, colour = "firebrick",
       arrow = grid::arrow(length = grid::unit(arrow_head_cm, "cm"),
                           type = "closed")
     ) +
-    ggrepel::geom_label_repel(
+    ggplot2::geom_segment(
       data = S_base,
-      ggplot2::aes(x = x1, y = y1, label = item),
-      size = 3.1, max.overlaps = Inf, label.size = 0,
-      label.padding = grid::unit(0.10, "lines")
+      ggplot2::aes(x = x1, y = y1, xend = label_x, yend = label_y),
+      linewidth = 0.25, colour = "grey45"
     ) +
-    ggplot2::coord_equal() +
+    ggplot2::geom_text(
+      data = S_base,
+      ggplot2::aes(x = label_x, y = label_y, label = short_label,
+                   hjust = label_hjust, vjust = label_vjust,
+                   angle = label_text_angle),
+      size = 2.65
+    ) +
+    ggplot2::coord_equal(clip = "off") +
+    ggplot2::scale_x_continuous(expand = ggplot2::expansion(mult = 0.13)) +
+    ggplot2::scale_y_continuous(expand = ggplot2::expansion(mult = 0.13)) +
     ggplot2::labs(x = "b1", y = "b2") +
-    theme_pub(12)
+    theme_pub(12) +
+    ggplot2::theme(plot.margin = ggplot2::margin(12, 75, 12, 75))
   
   # --- UNIT DISK ---
   draw_disk_outline <- function() {
@@ -4608,43 +5012,67 @@ plot_biplots <- function(Rtab, Base_A, U, use = c("a", "r"),
   max_mag_disk <- max(Rtab[[vmag_disk]], na.rm = TRUE)
   if (!is.finite(max_mag_disk) || max_mag_disk <= 0) max_mag_disk <- 1
   Rscale_disk <- Rdisk / max_mag_disk
-  
-  S_disk <- Rtab |>
+
+  A_disk <- prepare_display_levels(Rtab, vx_u1, vx_u2, vmag_disk) |>
     dplyr::mutate(
-      vx = .data[[vx_u1]],
-      vy = .data[[vx_u2]],
-      vmag = .data[[vmag_disk]],
-      octant = get_octant(vx, vy)
-    ) |>
-    dplyr::group_by(octant) |>
-    dplyr::arrange(dplyr::desc(vmag)) |>
-    dplyr::slice_head(n = as.integer(top_per_octant)) |>
-    dplyr::ungroup() |>
-    dplyr::transmute(
-      item,
       u0 = 0, v0 = 0,
       u1 = Rscale_disk * vx,
       v1 = Rscale_disk * vy
+    )
+  S_disk <- select_display_levels(Rtab, vx_u1, vx_u2, vmag_disk) |>
+    dplyr::mutate(
+      u0 = 0, v0 = 0,
+      u1 = Rscale_disk * vx,
+      v1 = Rscale_disk * vy
+    )
+  S_disk <- place_labels_on_ring(S_disk, 0, 0, 1.16)
+  A_disk_unlabelled <- A_disk |>
+    dplyr::anti_join(
+      S_disk |> dplyr::select(item, response_level),
+      by = c("item", "response_level")
     )
   
   p_disk <- ggplot2::ggplot() +
     ggplot2::geom_path(data = draw_disk_outline(), ggplot2::aes(x, y)) +
     ggplot2::geom_segment(
+      data = A_disk_unlabelled,
+      ggplot2::aes(x = u0, y = v0, xend = u1, yend = v1),
+      linewidth = 0.18, colour = "grey35", alpha = 0.10,
+      arrow = grid::arrow(length = grid::unit(arrow_head_cm * 0.45, "cm"),
+                          type = "closed")
+    ) +
+    ggplot2::geom_segment(
       data = S_disk,
       ggplot2::aes(x = u0, y = v0, xend = u1, yend = v1),
-      linewidth = 0.8, colour = "firebrick",
+      linewidth = 0.65, colour = "firebrick",
       arrow = grid::arrow(length = grid::unit(arrow_head_cm, "cm"), type = "closed")
     ) +
-    ggrepel::geom_text_repel(
+    ggplot2::geom_segment(
       data = S_disk,
-      ggplot2::aes(x = u1, y = v1, label = item),
-      size = 3.1, max.overlaps = Inf
+      ggplot2::aes(x = u1, y = v1, xend = label_x, yend = label_y),
+      linewidth = 0.25, colour = "grey45"
     ) +
-    ggplot2::coord_equal(xlim = c(-1, 1), ylim = c(-1, 1), expand = FALSE) +
+    ggplot2::geom_text(
+      data = S_disk,
+      ggplot2::aes(x = label_x, y = label_y, label = short_label,
+                   hjust = label_hjust, vjust = label_vjust,
+                   angle = label_text_angle),
+      size = 2.65
+    ) +
+    ggplot2::coord_equal(xlim = c(-1.55, 1.55), ylim = c(-1.55, 1.55),
+                         expand = FALSE, clip = "off") +
     ggplot2::labs(x = "u1 (whitened b1,b2)", y = "u2") +
-    theme_pub(12)
+    theme_pub(12) +
+    ggplot2::theme(plot.margin = ggplot2::margin(12, 75, 12, 75))
   
-  list(p_base = p_base, p_disk = p_disk)
+  list(
+    p_base = p_base,
+    p_disk = p_disk,
+    all_base = A_base,
+    all_disk = A_disk,
+    selected_base = S_base,
+    selected_disk = S_disk
+  )
 }
 
 plot_biplots_3d <- function(R3, Base, top_global = 32L,
@@ -4692,21 +5120,21 @@ plot_biplots_3d <- function(R3, Base, top_global = 32L,
   len23 <- sqrt(v2^2 + v3^2); m23 <- max(len23, na.rm = TRUE); if (!is.finite(m23) || m23 <= 1e-12) m23 <- 1
   
   S12 <- data.frame(
-    item = R3$item,
+    item = R3$display_label,
     x0 = cx1, y0 = cx2,
     x1 = cx1 + (0.80 * min(rx, ry) / m12) * v1,
     y1 = cx2 + (0.80 * min(rx, ry) / m12) * v2
   )
   
   S13 <- data.frame(
-    item = R3$item,
+    item = R3$display_label,
     x0 = cx1, y0 = cx3,
     x1 = cx1 + (0.80 * min(rx, rz) / m13) * v1,
     y1 = cx3 + (0.80 * min(rx, rz) / m13) * v3
   )
   
   S23 <- data.frame(
-    item = R3$item,
+    item = R3$display_label,
     x0 = cx2, y0 = cx3,
     x1 = cx2 + (0.80 * min(ry, rz) / m23) * v2,
     y1 = cx3 + (0.80 * min(ry, rz) / m23) * v3
@@ -4846,6 +5274,7 @@ plot_biplot_base_3d_interactive <- function(R3, Base,
     dplyr::mutate(.mag = mag) |>
     dplyr::group_by(oct) |>
     dplyr::arrange(dplyr::desc(.mag)) |>
+    dplyr::distinct(item, .keep_all = TRUE) |>
     dplyr::slice_head(n = as.integer(top_per_octant)) |>
     dplyr::ungroup()
   
@@ -4871,7 +5300,7 @@ plot_biplot_base_3d_interactive <- function(R3, Base,
   Rscale <- 0.80 * min(rx, ry, rz) / mL
   
   A <- data.frame(
-    item = R3s$item,
+    item = R3s$display_label,
     r1 = R3s$r_b1, r2 = R3s$r_b2, r3 = R3s$r_b3,
     x0 = cx, y0 = cy, z0 = cz,
     x1 = cx + Rscale * v1,
@@ -4985,15 +5414,17 @@ plot_biplot_base_3d_interactive <- function(R3, Base,
 
 # Biplots
 if (!is.null(varmap)) {
-  Rtab <- build_biplot_data(Z_A, varmap, Base_A, geom$U)     # default arrow="sd"
+  Rtab <- build_biplot_data(Z_A, varmap, levelmap, Base_A, geom$U)
   write_csv(Rtab, "items_vs_base_and_unitdisk_correlations.csv")
   
-  BIP  <- plot_biplots(Rtab, Base_A, geom$U, use = "a")      # arrows proportional to relevance
-  save_plot_gg("FIG_biplot_items_BASE", BIP$p_base, width = 8.0, height = 7.0)
-  save_plot_gg("FIG_biplot_items_UNITDISK", BIP$p_disk, width = 8.0, height = 7.0)
+  BIP  <- plot_biplots(Rtab, Base_A, geom$U, use = "r")      # response-level correlation vectors
+  write_csv(BIP$selected_base, "biplot_selected_arrows_BASE.csv")
+  write_csv(BIP$selected_disk, "biplot_selected_arrows_UNITDISK.csv")
+  save_plot_gg("FIG_biplot_items_BASE", BIP$p_base, width = 9.0, height = 9.0)
+  save_plot_gg("FIG_biplot_items_UNITDISK", BIP$p_disk, width = 9.0, height = 9.0)
   
   if (BASE_DIM >= 3L && ncol(Base) >= 3L) {
-    R3  <- build_biplot_data_3d(Z_A, varmap, Base)                  # default arrow="sd"
+    R3  <- build_biplot_data_3d(Z_A, varmap, levelmap, Base)
     BIP3 <- plot_biplots_3d(R3, Base, top_global = 32L, use = "a")  # use a_* for lengths
     save_plot_gg("FIG_biplot3D_items_b1b2", BIP3$p12, width = 8.0, height = 7.0)
     save_plot_gg("FIG_biplot3D_items_b1b3", BIP3$p13, width = 8.0, height = 7.0)

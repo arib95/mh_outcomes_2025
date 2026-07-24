@@ -1,21 +1,16 @@
-## mh_outcomes_2025
+# Item-level psychometric embeddings across two transdiagnostic cohorts
 
-Repository DOI: [![DOI](https://zenodo.org/badge/1116410049.svg)](https://doi.org/10.5281/zenodo.18002563)
+Analysis code for Ribeiro and Novais (2026), *Item-level psychometric data map continuous diagnostic and symptom fields across two transdiagnostic cohorts*.
 
-Supporting source code for Ribeiro & Novais (2025). From categories to fields: a multi-outcome map of mental health. Zenodo. [10.5281/zenodo.17298650](https://doi.org/10.5281/zenodo.17298650) (Preprint).
+- Code archive: [10.5281/zenodo.18002563](https://doi.org/10.5281/zenodo.18002563)
+- Derived artefacts: [10.5281/zenodo.21269864](https://doi.org/10.5281/zenodo.21269864)
 
-This repository is distributed under the GNU Affero General Public License (AGPL-3.0-or-later).
+## Reproducibility
 
-Earlier snapshots of this repository may contain incomplete or inconsistent licence notices.
-Use of this software is subject to the terms of the GNU Affero General Public License and,
-where applicable, the licences of third-party dependencies.
+`Scripts/` contains the analysis and plotting code. `Scripts/0_setup.R` is the final LA5c configuration, while `Scripts/0_setup_TCP.R` records the corresponding TCP configuration. The complete cohort projects—including their item-response schemas, model overrides, derived outputs, and session information—are preserved in the separate artefact archive above. Restoration instructions and checksums are provided in [`Artefacts/README.md`](Artefacts/README.md).
 
-Third-party dependencies are distributed under their respective licences and are not included in this repository.
+## Licence
 
-This program is distributed in the hope that it will be useful,
-but WITHOUT ANY WARRANTY; without even the implied warranty of
-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-GNU Affero General Public License for more details.
+This repository is distributed under the GNU Affero General Public License (AGPL-3.0-or-later). Third-party dependencies remain subject to their respective licences.
 
-A copy of the GNU Affero General Public License is available
-along with this program. See also <https://www.gnu.org/licenses/>.
+This program is distributed without any warranty; see [`Legal/LICENSE.txt`](Legal/LICENSE.txt) for details.

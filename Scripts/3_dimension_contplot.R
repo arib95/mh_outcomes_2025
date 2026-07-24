@@ -988,63 +988,6 @@ perm_test_oof <- function(yi, d, form, K, metric_is_bin, B, seed, is_two_col, is
   list(stat_obs = stat_obs, p = p, null_med = median(stats, na.rm = TRUE), null_q95 = as.numeric(quantile(stats, 0.95, na.rm = TRUE)))
 }
 
-# --- Stacking Helpers ---
-
-fit_glm_or_glmnet <- function(y, X) {
-  df <- as.data.frame(X)
-  yb <- as.integer(y > 0)
-  df$.y <- yb
-  n1 <- sum(yb == 1L)
-  n0 <- sum(yb == 0L)
-
-  if (requireNamespace("glmnet", quietly = TRUE) && n1 >= 8L && n0 >= 8L) {
-    x_mat <- as.matrix(df[setdiff(names(df), ".y")])
-    cv <- try(glmnet::cv.glmnet(x_mat, yb, alpha = 0, family = "binomial", parallel = FALSE), silent = TRUE)
-    if (!inherits(cv, "try-error")) {
-      return(list(type = "glmnet", fit = cv, xnames = colnames(x_mat)))
-    }
-  }
-  list(type = "glm", fit = stats::glm(.y ~ ., data = df, family = stats::binomial()))
-}
-
-pred_prob <- function(mod, newX) {
-  if (mod$type == "glmnet") {
-    x <- as.matrix(as.data.frame(newX)[, mod$xnames, drop = FALSE])
-    p <- stats::predict(mod$fit, x, s = "lambda.min", type = "response")
-  } else {
-    p <- stats::predict(mod$fit, newdata = as.data.frame(newX), type = "response")
-  }
-  as.numeric(pmin(pmax(p, 1e-6), 1 - 1e-6))
-}
-
-oof_prob_stacked_custom <- function(y, Base_df, XR, K, seed) {
-  y <- as.integer(y > 0)
-  fid <- make_folds_strat_general(y, K, seed)
-  pB <- rep(NA, length(y))
-  pR <- rep(NA, length(y))
-  pBR <- rep(NA, length(y))
-
-  for (k in seq_len(K)) {
-    tr <- fid != k
-    te <- fid == k
-    if (!any(tr) || !any(te)) next
-    modB <- fit_glm_or_glmnet(y[tr], Base_df[tr, , drop = FALSE])
-    pB[te] <- pred_prob(modB, Base_df[te, , drop = FALSE])
-    modR <- fit_glm_or_glmnet(y[tr], XR[tr, , drop = FALSE])
-    pR[te] <- pred_prob(modR, XR[te, , drop = FALSE])
-
-    Xm_tr <- data.frame(l1 = qlogis(pmin(pmax(pB[tr], 1e-6), 1 - 1e-6)), l2 = qlogis(pmin(pmax(pR[tr], 1e-6), 1 - 1e-6)))
-    m <- try(stats::glm(y[tr] ~ ., data = Xm_tr, family = stats::binomial()), silent = TRUE)
-    if (!inherits(m, "try-error")) {
-      Xm_te <- data.frame(l1 = qlogis(pmin(pmax(pB[te], 1e-6), 1 - 1e-6)), l2 = qlogis(pmin(pmax(pR[te], 1e-6), 1 - 1e-6)))
-      pBR[te] <- as.numeric(stats::predict(m, newdata = Xm_te, type = "response"))
-    } else {
-      pBR[te] <- (pB[te] + pR[te]) / 2
-    }
-  }
-  list(Base = pB, Resid = pR, Both = pBR)
-}
-
 fit_gam_safe <- function(form, family, data, method = "REML", gamma_val = 1.8) {
   fx <- try(mgcv::gam(
     form, family = family, data = data,
@@ -1929,6 +1872,7 @@ analyse_model_kernel <- function(d, yi, v_name, geom, Uobs, XR, is_two_col, K) {
 
   # Bootstrapped Interaction Test
   p_boot <- NA_real_
+  p_for_fdr <- p_ml
   if (DO_BOOT) {
     p_boot <- lrt_boot_gam(
       fit_null = fit_add_ml,
@@ -1946,7 +1890,7 @@ analyse_model_kernel <- function(d, yi, v_name, geom, Uobs, XR, is_two_col, K) {
     )
     
     if (!is.na(p_boot) && p_boot <= 0.01) {
-      message(sprintf("Small bootstrap p-value for %s (p=%.3f). Extending B to 1000...\n", v, p_boot))
+      message(sprintf("Small bootstrap p-value for %s (p=%.3f). Extending B to 1000...\n", v_name, p_boot))
       
       p_boot_high <- lrt_boot_gam(
         fit_null = fit_add_ml,
@@ -2038,13 +1982,6 @@ analyse_model_kernel <- function(d, yi, v_name, geom, Uobs, XR, is_two_col, K) {
   oof_auprg_point <- NA
   oof_auprg_lo <- NA
   oof_auprg_hi <- NA
-  auc_residual <- NA
-  auc_residual_lo <- NA
-  auc_residual_hi <- NA
-  auc_stacked <- NA
-  auc_stacked_lo <- NA
-  auc_stacked_hi <- NA
-  p_delta_stacked <- NA
   calib_intercept <- NA
   calib_slope <- NA
   calib_brier <- NA
@@ -2055,7 +1992,7 @@ analyse_model_kernel <- function(d, yi, v_name, geom, Uobs, XR, is_two_col, K) {
   calib_ntotal <- NA
 
   if (is_bin_oof) {
-    # --- BINARY 0/1: Uses Bootstrapping + Stacking ---
+    # --- BINARY 0/1: Uses Bootstrapping ---
     oof_metric <- "AUC"
     y_bin <- as.integer(d$y > 0)
 
@@ -2074,27 +2011,6 @@ analyse_model_kernel <- function(d, yi, v_name, geom, Uobs, XR, is_two_col, K) {
     wt <- suppressWarnings(stats::wilcox.test(p_oof ~ y_bin))
     p_rank <- wt$p.value
 
-    # Stacking
-    if (!is.null(XR)) {
-      stack_res <- try(oof_prob_stacked_custom(y_bin, d[, c("b1", "b2")], XR, K = 5, seed = OOF_SEED), silent = TRUE)
-      if (!inherits(stack_res, "try-error")) {
-        cr <- boot_ci_balanced(y_bin, stack_res$Resid, auc_point, B = OOF_BOOT_B)
-        auc_residual <- cr[1]
-        auc_residual_lo <- cr[2]
-        auc_residual_hi <- cr[3]
-        cs <- boot_ci_balanced(y_bin, stack_res$Both, auc_point, B = OOF_BOOT_B)
-        auc_stacked <- cs[1]
-        auc_stacked_lo <- cs[2]
-        auc_stacked_hi <- cs[3]
-        i0 <- which(y_bin == 0)
-        i1 <- which(y_bin == 1)
-        difs <- replicate(OOF_BOOT_B, {
-          ii <- c(sample(i0, length(i0), T), sample(i1, length(i1), T))
-          auc_point(y_bin[ii], stack_res$Both[ii]) - auc_point(y_bin[ii], stack_res$Base[ii])
-        })
-        p_delta_stacked <- min(1, 2 * min(mean(difs >= 0), mean(difs <= 0)))
-      }
-    }
     cal <- calibration_metrics_binary(y_bin, p_oof)
     calib_intercept <- cal$intercept
     calib_slope <- cal$slope
@@ -2210,8 +2126,6 @@ analyse_model_kernel <- function(d, yi, v_name, geom, Uobs, XR, is_two_col, K) {
     oof_metric = oof_metric, oof_point = oof_point, oof_lo = oof_lo, oof_hi = oof_hi, p_oof = p_rank, win_oof = win_oof,
     oof_auprc_point = oof_auprc_point, oof_auprc_lo = oof_auprc_lo, oof_auprc_hi = oof_auprc_hi,
     oof_auprg_point = oof_auprg_point, oof_auprg_lo = oof_auprg_lo, oof_auprg_hi = oof_auprg_hi,
-    auc_residual = auc_residual, auc_residual_lo = auc_residual_lo, auc_residual_hi = auc_residual_hi,
-    auc_stacked = auc_stacked, auc_stacked_lo = auc_stacked_lo, auc_stacked_hi = auc_stacked_hi, p_delta_stacked = p_delta_stacked,
     pd_angle_deg = pd_angle, pd_vec_u1 = u_pd[1], pd_vec_u2 = u_pd[2], pr80_20 = pr_metrics$pr80_20, delta_pp = pr_metrics$delta_pp,
     calib_intercept = calib_intercept, calib_slope = calib_slope, calib_brier = calib_brier, calib_ece = calib_ece, calib_nbins = calib_nbins,
 
@@ -2234,7 +2148,7 @@ analyse_model_kernel <- function(d, yi, v_name, geom, Uobs, XR, is_two_col, K) {
   job <- list(
     key = v_name, label = v_name, fields = fields, points = pts, caption = yi$label, geom = geom,
     sub_stats = list(n = nrow(d), n_pos = n_pos, K = K, de_add = de_add, de_full = de_full, edf = edf_used, kmin = kmin_used, rho = rho_s, r2_lbl = r2_label, r2_val = r2_val, dAIC = dAIC, used_model = used_model, p_LRT = p_ml),
-    oof_stats = list(name = oof_metric, point = oof_point, lo = oof_lo, hi = oof_hi, p = p_rank, auprc = oof_auprc_point, auprg = oof_auprg_point, pr80 = pr_metrics$pr80_20, dpp = pr_metrics$delta_pp, resid = auc_residual, resid_lo = auc_residual_lo, resid_hi = auc_residual_hi, stack = auc_stacked, stack_lo = auc_stacked_lo, stack_hi = auc_stacked_hi, p_delta = p_delta_stacked),
+    oof_stats = list(name = oof_metric, point = oof_point, lo = oof_lo, hi = oof_hi, p = p_rank, auprc = oof_auprc_point, auprg = oof_auprg_point, pr80 = pr_metrics$pr80_20, dpp = pr_metrics$delta_pp),
     calib_stats = list(int = calib_intercept, slope = calib_slope, brier = calib_brier, ece = calib_ece, bins = calib_nbins, n_total = calib_ntotal),
     calib_data = list(curve = calib_curve, line = calib_line),
     pd_stats = list(angle = pd_angle, u1 = u_pd[1], u2 = u_pd[2]),
@@ -2255,7 +2169,18 @@ num_cols <- names(DX)[vapply(DX, is.numeric, logical(1))]
 vars <- if (exists("vars_keep") && !is.null(vars_keep)) vars_keep else setdiff(num_cols, c("b1", "b2"))
 OVR <- get_model_overrides(vars, DX)
 
-run_one_var <- function(v) {
+work_items <- unlist(lapply(vars, function(v) {
+  ov <- OVR[[v]]
+  choice <- if (is.list(ov)) ov$choice else (ov %||% "auto")
+  if (identical(choice, "nominal")) {
+    levels <- sort(unique(DX[[v]][is.finite(DX[[v]])]))
+    lapply(levels, function(level) list(var = v, nominal_level = level))
+  } else {
+    list(list(var = v, nominal_level = NULL))
+  }
+}), recursive = FALSE)
+
+run_one_var <- function(v, nominal_level = NULL) {
   if (!(v %in% names(DX))) {
     return(NULL)
   }
@@ -2299,13 +2224,21 @@ run_one_var <- function(v) {
   # Branch: Nominal (One-vs-Rest loop)
   if (isTRUE(yi$is_nominal)) {
     out_list <- list()
-    levels <- yi$levels
+    levels <- if (is.null(nominal_level)) yi$levels else nominal_level
     for (lv in levels) {
       y_bin <- as.integer(DX[[v]] == lv)
       if (sum(y_bin, na.rm = TRUE) < K) next
 
-      yi_sub <- list(y = y_bin, family = binomial("logit"), label = paste0(v, "==", lv, " (1vR)"), inv = identity)
-      v_sub_name <- paste0(v, "==", lv)
+      level_label <- format(lv, trim = TRUE, scientific = FALSE)
+      level_token <- gsub("[^A-Za-z0-9._-]+", "_", level_label)
+      v_sub_name <- paste0(v, "__level_", level_token)
+      yi_sub <- list(
+        y = y_bin,
+        family = binomial("logit"),
+        label = paste0(v, " = ", level_label, " (nominal, one-vs-rest)"),
+        inv = identity,
+        is_binary = TRUE
+      )
 
       ok <- is.finite(y_bin) & is.finite(DX$b1) & is.finite(DX$b2)
       if (sum(ok) < 20) next
@@ -2319,14 +2252,23 @@ run_one_var <- function(v) {
       XR_sub <- if (!is.null(XR)) XR[ok, , drop = FALSE] else NULL
       
       res <- tryCatch(
-        analyse_model_kernel(d_sub, yi, v, geom, u_sub, XR_sub, isTRUE(yi$two_col), K),
+        analyse_model_kernel(d_sub, yi_sub, v_sub_name, geom, u_sub, XR_sub, FALSE, K),
         error = function(e) {
-          cat(sprintf("\n--- FAIL var: %s \nMessage: %s\n", v, e$message))
+          cat(sprintf("\n--- FAIL var: %s (level %s)\nMessage: %s\n", v, level_label, e$message))
           NULL
         }
       )
-      
-      if (!is.null(res)) out_list[[v_sub_name]] <- res
+
+      if (!is.null(res)) {
+        res$metrics[, `:=`(
+          parent_var = v,
+          nominal_level = level_label
+        )]
+        res$job$label <- paste0(v, " = ", level_label)
+        res$job$parent_var <- v
+        res$job$nominal_level <- level_label
+        out_list[[v_sub_name]] <- res
+      }
     }
     return(out_list)
   }
@@ -2381,64 +2323,255 @@ run_one_var <- function(v) {
   list(res)
 }
 
-message("Pass 1: Model Fitting...")
-res_list <- progressr::with_progress({
-  p <- progressr::progressor(steps = length(vars))
-  
-  FUTURE_LAPPLY(
-    vars,
-    function(v) {
-      
-      # Lock down threading to prevent conflicts in parallel workers
-      if (requireNamespace("RhpcBLASctl", quietly = TRUE)) RhpcBLASctl::blas_set_num_threads(1)
-      data.table::setDTthreads(1)
-      out <- tryCatch(
-        {
-          run_one_var(v)
-        },
-        error = function(e) {
-          # Log error to console (visible in main session)
-          message(sprintf("\n[Worker Error] Variable '%s' failed: %s", v, e$message))
-          NULL 
-        }
-      )
-      # Clean up RAM before next iteration
-      gc(verbose = FALSE)
+if (!requireNamespace("digest", quietly = TRUE)) {
+  stop("Package 'digest' is required for resumable Pass 1 checkpoints.")
+}
 
-      p() 
-      out
-    },
-    future.seed = TRUE
-  )
+# Keep large model and plotting objects out of the parent R process. Each
+# completed work item is written atomically and future runs reuse it.
+pass1_cache_config_names <- intersect(
+  c(
+    "K", "FIT_TIMEOUT", "DO_BOOT", "BOOT_B", "OOF_BOOT_B",
+    "OOF_MAX_PAIRS", "OOF_PERM_B", "PLOT_FILTER_BY_OOF_LOW",
+    "PLOT_OOF_LOW_MIN"
+  ),
+  ls(envir = .GlobalEnv)
+)
+pass1_cache_config <- mget(pass1_cache_config_names, envir = .GlobalEnv, inherits = TRUE)
+pass1_cache_signature <- digest::digest(
+  list(
+    cache_version = 1L,
+    DX = DX,
+    XR = XR,
+    U_DX = U_DX,
+    geom = geom,
+    overrides = OVR,
+    work_items = work_items,
+    config = pass1_cache_config,
+    analyse_model_kernel = paste(deparse(body(analyse_model_kernel), width.cutoff = 500L), collapse = "\n"),
+    run_one_var = paste(deparse(body(run_one_var), width.cutoff = 500L), collapse = "\n")
+  ),
+  algo = "xxhash64"
+)
+
+pass1_checkpoint_root <- normalizePath(
+  file.path(OUTPUTS_DIR, OUT_SUBDIR, "pass1_checkpoints"),
+  mustWork = FALSE
+)
+dir.create(pass1_checkpoint_root, recursive = TRUE, showWarnings = FALSE)
+
+pass1_checkpoint_name <- function(item) {
+  item_hash <- digest::digest(item, algo = "xxhash64")
+  item_stub <- substr(safe_file(as.character(item$var)), 1L, 80L)
+  paste0(item_stub, "_", item_hash, ".rds")
+}
+
+expected_checkpoint_names <- vapply(work_items, pass1_checkpoint_name, character(1))
+pass1_checkpoint_dir <- file.path(pass1_checkpoint_root, pass1_cache_signature)
+
+# A previous script revision used source-reference metadata in the signature,
+# so harmless edits could orphan an otherwise complete cache. Adopt a legacy
+# directory only when it contains the exact full current work-item set. A
+# stable manifest then prevents reuse after genuine data/configuration changes.
+candidate_dirs <- list.dirs(pass1_checkpoint_root, recursive = FALSE, full.names = TRUE)
+candidate_coverage <- if (length(candidate_dirs)) {
+  vapply(candidate_dirs, function(candidate_dir) {
+    sum(file.exists(file.path(candidate_dir, expected_checkpoint_names)))
+  }, integer(1))
+} else {
+  integer(0)
+}
+
+manifest_path_for <- function(candidate_dir) file.path(candidate_dir, "checkpoint_manifest.rds")
+manifest_matches <- if (length(candidate_dirs)) {
+  vapply(candidate_dirs, function(candidate_dir) {
+    manifest_path <- manifest_path_for(candidate_dir)
+    if (!file.exists(manifest_path)) return(FALSE)
+    manifest <- tryCatch(base::readRDS(manifest_path), error = function(e) NULL)
+    !is.null(manifest) && identical(manifest$stable_signature, pass1_cache_signature)
+  }, logical(1))
+} else {
+  logical(0)
+}
+
+if (any(manifest_matches)) {
+  matching_dirs <- candidate_dirs[manifest_matches]
+  matching_coverage <- candidate_coverage[manifest_matches]
+  pass1_checkpoint_dir <- matching_dirs[[which.max(matching_coverage)]]
+} else {
+  target_coverage <- if (pass1_checkpoint_dir %in% candidate_dirs) {
+    candidate_coverage[[match(pass1_checkpoint_dir, candidate_dirs)]]
+  } else {
+    0L
+  }
+  legacy_full <- candidate_dirs[
+    candidate_coverage == length(work_items) &
+      !file.exists(vapply(candidate_dirs, manifest_path_for, character(1)))
+  ]
+
+  if (target_coverage == 0L && length(legacy_full) == 1L) {
+    pass1_checkpoint_dir <- legacy_full[[1L]]
+    base::saveRDS(
+      list(
+        stable_signature = pass1_cache_signature,
+        work_items_signature = digest::digest(work_items, algo = "xxhash64"),
+        adopted_at = Sys.time()
+      ),
+      manifest_path_for(pass1_checkpoint_dir)
+    )
+    message(
+      "Adopting complete legacy Pass 1 cache: ", pass1_checkpoint_dir,
+      " (", length(work_items), "/", length(work_items), " items)"
+    )
+  }
+}
+
+dir.create(pass1_checkpoint_dir, recursive = TRUE, showWarnings = FALSE)
+pass1_checkpoint_payload_signature <- basename(pass1_checkpoint_dir)
+
+pass1_checkpoint_path <- function(item) {
+  file.path(pass1_checkpoint_dir, pass1_checkpoint_name(item))
+}
+
+checkpoint_paths <- vapply(work_items, pass1_checkpoint_path, character(1))
+checkpoint_exists <- file.exists(checkpoint_paths)
+pending_indices <- which(!checkpoint_exists)
+
+message(sprintf(
+  "Pass 1: Model Fitting... (%d/%d checkpoints already complete)",
+  sum(checkpoint_exists), length(work_items)
+))
+message("Pass 1 checkpoint directory: ", pass1_checkpoint_dir)
+
+progressr::with_progress({
+  p <- progressr::progressor(steps = length(work_items))
+  if (any(checkpoint_exists)) {
+    try(p(amount = sum(checkpoint_exists)), silent = TRUE)
+  }
+
+  if (length(pending_indices)) {
+    invisible(FUTURE_LAPPLY(
+      pending_indices,
+      function(item_index) {
+        item <- work_items[[item_index]]
+        checkpoint_path <- checkpoint_paths[[item_index]]
+        v <- item$var
+        nominal_level <- item$nominal_level
+        item_label <- if (is.null(nominal_level)) v else paste0(v, " = ", nominal_level)
+
+        out <- tryCatch(
+          {
+            if (requireNamespace("RhpcBLASctl", quietly = TRUE)) RhpcBLASctl::blas_set_num_threads(1)
+            data.table::setDTthreads(1)
+            run_one_var(v, nominal_level = nominal_level)
+          },
+          error = function(e) {
+            message(sprintf("\n[Worker Error] '%s' failed: %s", item_label, e$message))
+            NULL
+          }
+        )
+
+        checkpoint_tmp <- paste0(checkpoint_path, ".tmp-", Sys.getpid())
+        on.exit(unlink(checkpoint_tmp, force = TRUE), add = TRUE)
+        base::saveRDS(
+          list(signature = pass1_checkpoint_payload_signature, item = item, result = out),
+          checkpoint_tmp,
+          compress = "gzip"
+        )
+        if (!file.rename(checkpoint_tmp, checkpoint_path)) {
+          stop("Could not publish Pass 1 checkpoint: ", checkpoint_path)
+        }
+
+        rm(out)
+        gc(verbose = FALSE)
+        try(p(), silent = TRUE)
+        TRUE
+      },
+      future.seed = TRUE,
+      # Each nominal response level is an independent future and failure boundary.
+      future.scheduling = Inf
+    ))
+  }
 })
 
-# Flatten results and compute FDR
-res_list <- unlist(res_list, recursive = FALSE)
-res_list <- Filter(Negate(is.null), res_list)
+# Stream completed checkpoints into the compact metrics table and individual
+# plot-job files. At no point are all fitted objects resident in memory.
+job_dir_abs <- normalizePath(
+  file.path(OUTPUTS_DIR, OUT_SUBDIR, "plot_jobs"),
+  mustWork = FALSE
+)
+dir.create(job_dir_abs, recursive = TRUE, showWarnings = FALSE)
 
-MET <- if (length(res_list)) data.table::rbindlist(lapply(res_list, `[[`, "metrics"), fill = TRUE) else data.table::data.table()
-JOBS <- lapply(res_list, `[[`, "job")
-names(JOBS) <- sapply(JOBS, `[[`, "key")
-DX_FITS <- lapply(res_list, `[[`, "fit")
-names(DX_FITS) <- names(JOBS)
+read_pass1_checkpoint <- function(path, attempts = 3L) {
+  last_error <- NULL
+  for (attempt in seq_len(attempts)) {
+    payload <- tryCatch(base::readRDS(path), error = function(e) {
+      last_error <<- e
+      NULL
+    })
+    if (!is.null(payload) && identical(payload$signature, pass1_checkpoint_payload_signature)) {
+      return(payload)
+    }
+    if (attempt < attempts) Sys.sleep(0.2 * attempt)
+  }
+  detail <- if (is.null(last_error)) "signature mismatch" else conditionMessage(last_error)
+  stop(sprintf("Could not read Pass 1 checkpoint: %s (%s)", path, detail), call. = FALSE)
+}
 
-if (length(JOBS) > 0 && (is_dx_mode || is_cl_mode)) {
-  
-  # Determine prefix based on mode
+metric_parts <- list()
+job_files <- character(0)
+DX_FITS <- list()
+DX_PREV <- list()
+DX_USED_MODEL <- list()
+DX_FIELDS <- list()
+
+message(sprintf("Collecting %d Pass 1 checkpoints without retaining them in RAM...", length(checkpoint_paths)))
+for (checkpoint_index in seq_along(checkpoint_paths)) {
+  payload <- read_pass1_checkpoint(checkpoint_paths[[checkpoint_index]])
+  checkpoint_results <- payload$result
+  checkpoint_results <- Filter(Negate(is.null), checkpoint_results)
+
+  for (one_result in checkpoint_results) {
+    metric_parts[[length(metric_parts) + 1L]] <- one_result$metrics
+
+    job <- one_result$job
+    nm <- job$key
+    job_path <- file.path(job_dir_abs, paste0("job_", nm, ".rds"))
+    base::saveRDS(job, job_path, compress = "gzip")
+    job_files <- c(job_files, job_path)
+
+    if (is_dx_mode || is_cl_mode) {
+      DX_FITS[[nm]] <- one_result$fit
+      DX_PREV[[nm]] <- mean(job$points$y, na.rm = TRUE)
+      DX_USED_MODEL[[nm]] <- job$sub_stats$used_model
+      DX_FIELDS[[nm]] <- job$fields
+    }
+  }
+
+  payload <- NULL
+  checkpoint_results <- NULL
+  one_result <- NULL
+  job <- NULL
+  if (checkpoint_index %% 10L == 0L) gc(verbose = FALSE)
+}
+
+job_files <- unique(job_files)
+MET <- if (length(metric_parts)) {
+  data.table::rbindlist(metric_parts, fill = TRUE)
+} else {
+  data.table::data.table()
+}
+rm(metric_parts)
+gc(verbose = FALSE)
+
+if (length(job_files) > 0L && (is_dx_mode || is_cl_mode)) {
   prefix <- if (is_cl_mode) "cluster" else "dx"
   message(sprintf("Saving %s mode artifacts...", prefix))
-  
-  # A. Extract metadata for the Fits file (Model objects + metadata)
-  DX_PREV <- lapply(JOBS, function(j) mean(j$points$y, na.rm = TRUE))
-  DX_USED_MODEL <- lapply(JOBS, function(j) j$sub_stats$used_model)
-  
+
   saveRDS(
     list(fits = DX_FITS, prev = DX_PREV, used_model = DX_USED_MODEL),
     file.path(OUT_SUBDIR, paste0(prefix, "_gam_fits.rds"))
   )
-  
-  # B. Extract Fields for the Fields file (Surfaces)
-  DX_FIELDS <- lapply(JOBS, `[[`, "fields")
   saveRDS(DX_FIELDS, file.path(OUT_SUBDIR, paste0(prefix, "_fields.rds")))
 }
 
@@ -2519,6 +2652,7 @@ filter_plot_jobs_by_oof_low <- function(job_files,
 
 plot_worker <- function(job, OUT_SUBDIR, MET_dt = NULL, OOF_PERM_B = 200) {
   nm <- job$key
+  display_nm <- job$label %||% nm
   s <- job$sub_stats
   
   q_oof_val <- NA_real_
@@ -2595,16 +2729,9 @@ plot_worker <- function(job, OUT_SUBDIR, MET_dt = NULL, OOF_PERM_B = 200) {
     star
   )
   
-  # B. Stacking Info
   o <- job$oof_stats
-  if (!is.null(o$stack) && is.finite(o$stack)) {
-    f_str <- if (is.finite(o$resid)) sprintf("Resid=%.3f(%.3f-%.3f)", o$resid, o$resid_lo %||% NA, o$resid_hi %||% NA) else ""
-    s_str <- sprintf(" | Stack=%.3f(%.3f-%.3f)", o$stack, o$stack_lo %||% NA, o$stack_hi %||% NA)
-    d_str <- if (is.finite(o$p_delta)) sprintf(" | Δp=%.3g", o$p_delta) else ""
-    base_txt <- paste0(base_txt, "\n", trimws(paste0(f_str, s_str, d_str)))
-  }
-  
-  # C. OOF P-values & Q-values
+
+  # B. OOF P-values & Q-values
   q_val <- NA_real_
   if (!is.null(MET_dt) && "q_oof" %in% names(MET_dt)) {
     row_q <- MET_dt[var == nm, q_oof]
@@ -2623,7 +2750,7 @@ plot_worker <- function(job, OUT_SUBDIR, MET_dt = NULL, OOF_PERM_B = 200) {
     ""
   }
   
-  # D. ML Metrics
+  # C. ML Metrics
   fmt_ci <- function(p, l, h) sprintf("%.3f (%.3f–%.3f)", p, l, h)
   oof_line <- paste0("OOF ", o$name, "=", fmt_ci(o$point, o$lo, o$hi), p_txt, q_txt)
   
@@ -2689,7 +2816,7 @@ plot_worker <- function(job, OUT_SUBDIR, MET_dt = NULL, OOF_PERM_B = 200) {
   
   # --- 3. Plot Generation ---
   
-  P2d <- plots_for_cont(job$fields, job$geom, nm, base_txt, job$caption, job$points, lims_override = lims_override)
+  P2d <- plots_for_cont(job$fields, job$geom, display_nm, base_txt, job$caption, job$points, lims_override = lims_override)
   save_plot_gg(file.path(OUT_SUBDIR, paste0("field_", nm, "_disk_full")), P2d$p_std, width = 7.2, height = 5.6)
   save_plot_gg(file.path(OUT_SUBDIR, paste0("field_", nm, "_base_full")), P2d$p_base, width = 7.2, height = 5.6)
   save_plot_gg(file.path(OUT_SUBDIR, paste0("field_", nm, "_square_full")), P2d$p_sq, width = 7.2, height = 5.6)
@@ -2709,13 +2836,13 @@ plot_worker <- function(job, OUT_SUBDIR, MET_dt = NULL, OOF_PERM_B = 200) {
     p
   }
   
-  p1 <- plot_scat(job$points, job$marginals$u1, "u1", paste("U1:", nm))
+  p1 <- plot_scat(job$points, job$marginals$u1, "u1", paste("U1:", display_nm))
   save_plot_gg(file.path(OUT_SUBDIR, paste0("u1_scatter_", nm)), p1, width = 4, height = 4)
   
-  p2 <- plot_scat(job$points, job$marginals$u2, "u2", paste("U2:", nm))
+  p2 <- plot_scat(job$points, job$marginals$u2, "u2", paste("U2:", display_nm))
   save_plot_gg(file.path(OUT_SUBDIR, paste0("u2_scatter_", nm)), p2, width = 4, height = 4)
   
-  ppd <- plot_scat(job$pd_points, job$marginals$pd, "t", paste("PD:", nm)) +
+  ppd <- plot_scat(job$pd_points, job$marginals$pd, "t", paste("PD:", display_nm)) +
     labs(subtitle = sprintf("Angle: %.1f", pd$angle))
   save_plot_gg(file.path(OUT_SUBDIR, paste0("uPD_scatter_", nm)), ppd, width = 4, height = 4)
   
@@ -2738,7 +2865,7 @@ plot_worker <- function(job, OUT_SUBDIR, MET_dt = NULL, OOF_PERM_B = 200) {
       }
       pc <- pc + geom_point(shape = 16, size = 1.8, alpha = 0.7) +
         coord_equal(xlim = c(0, 1), ylim = c(0, 1), expand = FALSE) +
-        labs(x = "Predicted probability", y = "Observed event rate", title = paste("Calibration:", nm), subtitle = cal_txt, caption = cap_txt) +
+        labs(x = "Predicted probability", y = "Observed event rate", title = paste("Calibration:", display_nm), subtitle = cal_txt, caption = cap_txt) +
         theme_pub(11) + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), legend.position = "none")
       save_plot_gg(file.path(OUT_SUBDIR, paste0("calibration_", nm)), pc, width = 5.5, height = 5)
     }
@@ -2757,26 +2884,23 @@ if (nrow(MET) > 0) {
 message("Pass 2: Plotting...")
 
 # --------- Pass 2: Plotting (Full Parallel) ----------
-if (length(JOBS) > 0) {
-  
-  job_dir_abs <- normalizePath(file.path(OUTPUTS_DIR, OUT_SUBDIR, "plot_jobs"), mustWork = FALSE)
-  dir.create(job_dir_abs, recursive = TRUE, showWarnings = FALSE)
-  
-  message(sprintf("Serializing %d plot jobs to disk...", length(JOBS)))
-  
-  job_files <- character(length(JOBS))
-  job_names <- names(JOBS)
-  
-  for (i in seq_along(JOBS)) {
-    nm <- job_names[i]
-    fpath <- file.path(job_dir_abs, paste0("job_", nm, ".rds"))
-    saveRDS(JOBS[[i]], fpath)
-    job_files[i] <- fpath
+if (length(job_files) > 0L) {
+
+  read_plot_job <- function(path, attempts = 5L) {
+    last_error <- NULL
+    for (attempt in seq_len(attempts)) {
+      job <- tryCatch(readRDS(path), error = function(e) {
+        last_error <<- e
+        NULL
+      })
+      if (!is.null(job)) return(job)
+      if (attempt < attempts) Sys.sleep(0.2 * attempt)
+    }
+    stop(sprintf(
+      "Could not read serialized plot job after %d attempts: %s (%s)",
+      attempts, path, conditionMessage(last_error)
+    ), call. = FALSE)
   }
-  
-  # Clean up RAM
-  rm(JOBS, res_list)
-  gc()
   
   job_files <- filter_plot_jobs_by_oof_low(job_files, MET_dt, tag = "pass2")
   
@@ -2792,7 +2916,7 @@ if (length(JOBS) > 0) {
           if (requireNamespace("RhpcBLASctl", quietly = TRUE)) RhpcBLASctl::blas_set_num_threads(1)
           data.table::setDTthreads(1)
           
-          job_data <- readRDS(fpath)
+          job_data <- read_plot_job(fpath)
           
           tryCatch(plot_worker(job_data, OUT_SUBDIR, MET_dt), error = function(e) {
             message(sprintf("Error plotting %s: %s", job_data$key, e$message))
@@ -2806,7 +2930,6 @@ if (length(JOBS) > 0) {
     })
   }
 }
-if (is_dx_mode) saveRDS(DX_FITS, file.path(OUT_SUBDIR, "dx_gam_fits.rds"))
 
 message("Done.")
 

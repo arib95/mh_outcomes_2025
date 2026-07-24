@@ -7,7 +7,7 @@ suppressPackageStartupMessages({
   library(Matrix)
   library(matrixStats)
   library(tools)
-  
+
   # Data
   library(readr)
   library(dplyr)
@@ -15,7 +15,7 @@ suppressPackageStartupMessages({
   library(data.table)
   library(zoo)
   library(tibble)
-  
+
   # Maths / ML
   library(cluster)
   library(RANN)
@@ -27,7 +27,7 @@ suppressPackageStartupMessages({
   library(expm)
   library(clue)
   library(rrcov)
-  
+
   # Graphs / viz
   library(ggplot2)
   library(scales)
@@ -36,7 +36,7 @@ suppressPackageStartupMessages({
   library(patchwork)
   library(plotly)
   library(ks)
-  
+
   # Domain / extras
   library(igraph)
   library(aricode)
@@ -51,7 +51,7 @@ suppressPackageStartupMessages({
   library(isotone)
   library(grid)
   library(metR)
-  
+
   # parallel
   library(withr)
   library(future)
@@ -102,8 +102,8 @@ FUTURE_GLOBALS_MAXSIZE <- threading_options$FUTURE_GLOBALS_MAXSIZE
 
 # Palette / plotting defaults
 PALETTE_ENGINE     <- "scico"
-PALETTE_NAME       <- "lipari"   # sequential
-PALETTE_NAME_DIV   <- "vik"      # diverging
+PALETTE_NAME       <- "lapaz"   # sequential
+PALETTE_NAME_DIV   <- "cork"      # diverging
 PALETTE_DIRECTION  <- 1L
 PALETTE_COLOURS    <- NULL
 
@@ -332,12 +332,12 @@ STAB_SD_GRID <- c(0, 0.05, 0.10, 0.15, 0.20)
 STAB_REPS    <- 600L
 
 # Outcome plots
-behaviour_csv <- "data/wide_diagnoses.csv"
-OUT_SUBDIR    <- "wide_diagnoses"
+# behaviour_csv <- "data/wide_diagnoses.csv"
+# OUT_SUBDIR    <- "wide_diagnoses"
 # behaviour_csv <- "data/cluster_membership_all_participants.csv"
 # OUT_SUBDIR    <- "clusters"
-# behaviour_csv <- "data/psychometric_matrix.csv"
-# OUT_SUBDIR    <- "psychometric_matrix"
+behaviour_csv <- "data/psychometric_matrix.csv"
+OUT_SUBDIR    <- "psychometric_matrix"
 # behaviour_csv <- "data/projection.csv"
 # OUT_SUBDIR    <- "tobis_out"
 
@@ -436,12 +436,12 @@ clean_ggplot_env <- function(p) {
 
 save_plot_gg <- function(name, plot, width, height, dpi = PNG_DPI, save_rds = FALSE) {
   if (!SAVE_IMAGES && !SAVE_PLOT_RDS) return(invisible())
-  
+
   base_path <- file.path(OUTPUTS_DIR, name)
   png_path  <- paste0(base_path, ".png")
   pdf_path  <- paste0(base_path, ".pdf")
   rds_path  <- paste0(base_path, ".rds")
-  
+
   if (SAVE_IMAGES) {
     if (isTRUE(USE_RAGG) && requireNamespace("ragg", quietly = TRUE)) {
       ggplot2::ggsave(
@@ -455,19 +455,19 @@ save_plot_gg <- function(name, plot, width, height, dpi = PNG_DPI, save_rds = FA
         width = width, height = height, dpi = dpi
       )
     }
-    
+
     ggplot2::ggsave(
       pdf_path, plot = plot,
       width = width, height = height,
       device = grDevices::cairo_pdf
     )
   }
-  
+
   if (save_rds) {
     plot_clean <- clean_ggplot_env(plot)
     base::saveRDS(plot_clean, file = rds_path)
   }
-  
+
   invisible(plot)
 }
 
@@ -503,10 +503,10 @@ set.seed(SEED_GLOBAL)
   expr <- substitute(expr)
   if (is.null(seed) || !is.finite(seed)) return(eval(expr, parent.frame()))
   seed <- as.integer(seed)
-  
+
   had_seed <- exists(".Random.seed", envir = .GlobalEnv, inherits = FALSE)
   old_seed <- if (had_seed) get(".Random.seed", envir = .GlobalEnv, inherits = FALSE) else NULL
-  
+
   set.seed(seed)
   on.exit({
     if (had_seed) {
@@ -515,7 +515,7 @@ set.seed(SEED_GLOBAL)
       rm(".Random.seed", envir = .GlobalEnv)
     }
   }, add = TRUE)
-  
+
   eval(expr, parent.frame())
 }
 
@@ -565,7 +565,7 @@ scale_prob_fill <- function(limits = NULL, name = NULL) {
   eng <- tolower(PALETTE_ENGINE)
   dir <- PALETTE_DIRECTION
   pal <- PALETTE_NAME
-  
+
   if (eng == "scico" && requireNamespace("scico", quietly = TRUE)) {
     scico::scale_fill_scico(
       palette = pal,
@@ -755,15 +755,15 @@ resave_plot <- function(name,
                         types = c("png", "pdf"),
                         suffix = NULL) {
   p <- readRDS(file.path(paste0(name, ".rds")))
-  
+
   if (!is.null(suffix) && nzchar(suffix)) {
     name_out <- paste0(name, "_", suffix)
   } else {
     name_out <- paste0(name, "_", width, "x", height)
   }
-  
+
   base_path <- file.path(OUTPUTS_DIR, name_out)
-  
+
   if ("png" %in% types) {
     ggplot2::ggsave(
       paste0(base_path, ".png"),
@@ -773,7 +773,7 @@ resave_plot <- function(name,
       dpi = dpi
     )
   }
-  
+
   if ("pdf" %in% types) {
     ggplot2::ggsave(
       paste0(base_path, ".pdf"),
@@ -783,7 +783,7 @@ resave_plot <- function(name,
       device = grDevices::cairo_pdf
     )
   }
-  
+
   invisible(base_path)
 }
 

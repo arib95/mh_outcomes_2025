@@ -4,14 +4,21 @@
 
 # --------- config toggles (optional) ----------
 SKIP_IF_METRICS_EXIST <- TRUE   # set TRUE to skip if metrics already present
-STOP_ON_ERROR         <- TRUE   # set TRUE to halt on firsailure
+STOP_ON_ERROR         <- TRUE   # set TRUE to halt on first failure
 
 # --------- bootstrap project context ----------
+.sweep_file <- tryCatch(normalizePath(sys.frame(1)$ofile, mustWork = TRUE), error = function(e) NA_character_)
+if (!is.character(.sweep_file) || length(.sweep_file) != 1L || is.na(.sweep_file)) {
+  stop("Could not determine the location of sweep_contplot.R; source it by filename.")
+}
+PROJECT_ROOT <- dirname(dirname(.sweep_file))
+setwd(PROJECT_ROOT)
+
 SETUP_CFG <- list()
-source("0_setup.R", chdir = TRUE)  # brings OUTPUTS_DIR, helpers, defaults, etc.
+source(file.path(PROJECT_ROOT, "0_setup.R"), chdir = FALSE)
 
 # Where to sweep: derive the data directory from the configured behaviour_csv
-data_dir <- dirname(behaviour_csv)
+data_dir <- file.path(PROJECT_ROOT, dirname(behaviour_csv))
 
 # Allow overriding the data_dir from the command line (optional)
 args <- commandArgs(TRUE)
@@ -67,7 +74,7 @@ for (f in csv_files) {
   
   # Execute one full run. Keep the global env to reuse setup objects.
   ok <- try({
-    source("3_dimension_contplot.R", chdir = TRUE, local = FALSE)
+    source(file.path(PROJECT_ROOT, "3_dimension_contplot.R"), chdir = FALSE, local = FALSE)
   }, silent = !STOP_ON_ERROR)
   
   if (inherits(ok, "try-error")) {
